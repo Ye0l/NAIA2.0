@@ -50,6 +50,48 @@ def _pd_read(source: Any, columns: Optional[list[str]]):
     return pd.read_parquet(_rewindable(source), columns=columns)
 
 
+def compact_string_types_mapper():
+    """Arrow ``types_mapper`` that keeps UTF-8 columns in shared Arrow buffers.
+
+    An object-dtype conversion allocates one Python ``str`` per cell; the Arrow
+    string dtype keeps the parquet UTF-8 buffer and an offset array instead, so
+    concatenation and frame copies stay shallow. ``na_value=np.nan`` preserves
+    the object-dtype missing-value semantics the search and result code is
+    written against.
+    """
+    import numpy as np
+    import pandas as pd
+    import pyarrow as pa
+
+    string_dtype = pd.StringDtype(storage="pyarrow", na_value=np.nan)
+
+    def mapper(dtype):
+        if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+            return string_dtype
+        return None
+
+    return mapper
+
+
+def release_arrow_pool() -> None:
+    """Hand PyArrow's freed pages back to the OS.
+
+    PyArrow allocates through mimalloc (jemalloc on some builds), which keeps
+    freed blocks in its own pool rather than returning them. After an archive
+    scan that pool can hold most of a gigabyte the process no longer owns —
+    ``pa.total_allocated_bytes()`` reads near zero while RSS stays high, and the
+    next search allocates on top of it. Call this once a bulk read has produced
+    its frame; live buffers (the frame's own columns) are never touched.
+    Best-effort: a pool without the API, or an import failure, is not an error.
+    """
+    try:
+        import pyarrow as pa
+
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+
+
 def parquet_total_rows(source: Path | str | bytes) -> int:
     """Best-effort row count from parquet metadata (0 if unreadable)."""
     try:
@@ -112,18 +154,7 @@ def read_parquet_chunked(
     # Arrow-backed strings keep UTF-8 buffers shared across concatenation and
     # snapshot copies instead of allocating a Python object per cell. Numeric
     # and nested columns retain the existing conversion semantics.
-    mapper = None
-    if compact_strings:
-        import pandas as pd
-        import pyarrow as pa
-        import numpy as np
-
-        string_dtype = pd.StringDtype(storage="pyarrow", na_value=np.nan)
-
-        def mapper(dtype):
-            if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
-                return string_dtype
-            return None
+    mapper = compact_string_types_mapper() if compact_strings else None
 
     frames: list[Any] = []
     loaded = 0
@@ -154,11 +185,16 @@ def read_parquet_chunked(
         frame = _pd_read(path, columns)
         _tick(len(frame), len(frame))
         return frame
-    if len(frames) == 1:
-        return frames[0].reset_index(drop=True)
-    import pandas as pd
+    try:
+        if len(frames) == 1:
+            return frames[0].reset_index(drop=True)
+        import pandas as pd
 
-    return pd.concat(frames, ignore_index=True)
+        return pd.concat(frames, ignore_index=True)
+    finally:
+        # The per-batch Arrow buffers are dead once the frames are built/joined.
+        if compact_strings:
+            release_arrow_pool()
 
 
 # ── Search-pool load progress broadcast ──────────────────────────────────────
@@ -254,6 +290,8 @@ def make_search_load_progress(
 
 
 __all__ = [
+    "compact_string_types_mapper",
+    "release_arrow_pool",
     "read_parquet_chunked",
     "parquet_total_rows",
     "make_search_load_progress",

@@ -8,6 +8,8 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from core.parquet_chunk_loader import release_arrow_pool
+
 
 def _text_series(series: pd.Series) -> pd.Series:
     # Do not expand millions of Arrow strings back into Python objects just to
@@ -548,10 +550,11 @@ class SearchResultModel:
             new_df = new_df.copy()
 
         if hasattr(self, "df") and self.df is not None:
-            try:
-                self.df.drop(self.df.index, inplace=True)
-            except Exception:
-                pass
+            # 예전에는 참조를 끊기 전에 ``self.df.drop(self.df.index, inplace=True)`` 로
+            # 옛 프레임을 먼저 비웠다. 그런데 drop(inplace) 은 *남길 행*(여기선 0행)으로
+            # 모든 컬럼을 새로 take 한다 - 놓아주려는 프레임을 놓아주기 직전에 사실상 한
+            # 벌 더 만드는 셈이다(4백만 행 Arrow 풀에서 순간 +873MiB 실측). 참조만 끊어도
+            # 같은 목적을 달성한다.
             del self.df
             gc.collect()
 
@@ -567,6 +570,10 @@ class SearchResultModel:
                 self._refresh_legacy_df_pointer()
             else:
                 self.append_dataframe(new_df)
+        # 교체된 옛 풀의 Arrow 버퍼는 여기서 확실히 죽는다. PyArrow 할당자는 해제한
+        # 페이지를 자기 풀에 쥐고 있으므로(프로세스 RSS 는 그대로), 검색을 거듭할수록
+        # 쓰지도 않는 메모리가 쌓인다. 새 프레임 설치가 끝난 뒤에 한 번 돌려준다.
+        release_arrow_pool()
 
     def get_dataframe(self) -> pd.DataFrame:
         """결과 데이터프레임을 반환합니다."""

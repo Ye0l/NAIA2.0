@@ -6,9 +6,79 @@ import pyarrow.compute as pc
 from typing import Dict, List, Any, Optional
 
 
+def _arrow_values(series: pd.Series):
+    """Underlying Arrow array of an Arrow-backed Series (``None`` for object/legacy).
+
+    Arrow-backed columns expose their buffers directly, so tag joins and
+    substring matching run on the parquet UTF-8 bytes without ever building a
+    Python ``str`` per cell.
+    """
+    values = getattr(series, "array", None)
+    return getattr(values, "_pa_array", None)
+
+
+def _mask_to_numpy(result) -> np.ndarray:
+    """Arrow boolean (Array or ChunkedArray) -> numpy bool mask, nulls as False."""
+    return pc.fill_null(result, False).to_numpy(zero_copy_only=False)
+
+
+def _read_parquet_compact(file_path: str) -> pd.DataFrame:
+    """Read one archive parquet keeping UTF-8 columns in shared Arrow buffers.
+
+    An object-dtype read allocates a Python ``str`` per cell. Across a
+    multi-file archive scan (one full file per worker thread) that transient
+    dominates the process peak, and glibc does not hand those small blocks back
+    to the OS afterwards, so the resident set stays high long after the scan.
+    Arrow strings keep one contiguous buffer per column instead. Falls back to
+    the plain pandas reader if the compact path is unavailable.
+    """
+    try:
+        import pyarrow.parquet as pq
+
+        from core.parquet_chunk_loader import compact_string_types_mapper
+
+        table = pq.read_table(file_path)
+        # self_destruct releases each Arrow column as it is converted; the table
+        # is dropped here either way, so the conversion never holds both.
+        return table.to_pandas(
+            types_mapper=compact_string_types_mapper(),
+            split_blocks=True,
+            self_destruct=True,
+        )
+    except Exception:
+        return pd.read_parquet(file_path, engine="pyarrow")
+
+
+def _iter_parquet_frames(file_path: str, batch_rows: int):
+    """Yield one archive parquet as row-batch DataFrames (Arrow-backed strings).
+
+    A worker used to hold a whole bucket file while it filtered it, so the scan's
+    peak was ``workers x full file`` no matter how few rows actually matched.
+    Streaming row batches makes that ``workers x one batch`` plus the survivors.
+    Falls back to a single whole-file frame if the batch reader is unavailable.
+    """
+    try:
+        import pyarrow.parquet as pq
+
+        from core.parquet_chunk_loader import compact_string_types_mapper
+
+        parquet_file = pq.ParquetFile(file_path)
+        mapper = compact_string_types_mapper()
+    except Exception:
+        yield _read_parquet_compact(file_path)
+        return
+
+    for batch in parquet_file.iter_batches(batch_size=batch_rows):
+        yield batch.to_pandas(types_mapper=mapper)
+
+
 class SearchEngine:
     """Parquet 파일에서 태그를 검색하는 로직을 수행하는 핵심 엔진"""
     TAG_COLUMNS = ['copyright', 'character', 'artist', 'meta', 'general']
+    # Rows per streamed batch. Bounds the transient a worker holds while it
+    # filters; small enough that N workers stay flat, large enough that the
+    # Arrow match kernels still run on a worthwhile array.
+    BATCH_ROWS = 100_000
 
     def _build_tags_string(self, df: pd.DataFrame) -> pd.Series:
         """태그 컬럼들을 쉼표로 결합한 tags_string 을 행 단위로 생성(벡터화).
@@ -25,6 +95,38 @@ class SearchEngine:
         first = df[self.TAG_COLUMNS[0]].astype(object)
         rest = [df[col].astype(object) for col in self.TAG_COLUMNS[1:]]
         return first.str.cat(rest, sep=',', na_rep='')
+
+    def _tags_array(self, df: pd.DataFrame):
+        """행 단위 ``a,b,c`` 태그 텍스트를 **Arrow 배열로만** 만든다.
+
+        ``binary_join_element_wise`` 한 번(C레벨)으로 5개 컬럼을 잇는다 — 셀당 파이썬
+        문자열을 만들지 않으므로 아카이브 스캔의 순간 피크가 태그 텍스트 한 벌(UTF-8
+        버퍼)로 끝난다. 이미 Arrow 인 컬럼은 버퍼를 그대로 쓰고, object 컬럼만 한 번
+        변환한다(``filter_source_frame`` 처럼 빠진 태그 컬럼을 ``""`` 로 채워 넣는
+        경로에서도 나머지 컬럼이 Arrow 면 이득을 잃지 않는다). 변환이 불가능한 프레임은
+        예전 ``Series.str.cat`` 경로로 떨어진다. 결과는 어느 쪽이든 동치다
+        (결측 → ``''``, 구분자 ``','``).
+        """
+        try:
+            arrow_columns = []
+            for name in self.TAG_COLUMNS:
+                column = df[name]
+                values = _arrow_values(column)
+                if values is None:
+                    values = pa.array(column, from_pandas=True)
+                arrow_columns.append(values)
+            # 커널은 모든 인자가 같은 문자열 타입일 때만 잡힌다. object 변환은 ``string``,
+            # pandas 의 Arrow 문자열 dtype 은 ``large_string`` 이라 한쪽으로 맞춰 준다.
+            target = arrow_columns[0].type
+            if any(pa.types.is_large_string(values.type) for values in arrow_columns):
+                target = pa.large_string()
+            filled = [
+                pc.fill_null(values if values.type == target else values.cast(target), "")
+                for values in arrow_columns
+            ]
+            return pc.binary_join_element_wise(*filled, pa.scalar(",", type=target))
+        except Exception:
+            return pa.array(self._build_tags_string(df), from_pandas=True)
 
     def _parse_query(self, query: str) -> Dict[str, List[Any]]:
         query = query.strip().replace("_", " ")
@@ -69,15 +171,20 @@ class SearchEngine:
         search_params = self._parse_query(query)
         exclude_params = self._parse_query(exclude_query)
 
-        # 필터링 전에 'tags_string' 컬럼이 없으면 생성
-        if 'tags_string' not in df.columns:
-            df['tags_string'] = self._build_tags_string(df)
-
-        tags = pa.array(df['tags_string'], from_pandas=True)  # NaN -> null (na=False 동치)
+        # 태그 텍스트는 Arrow 배열로만 만든다. 예전에는 'tags_string' 컬럼을 **호출자의
+        # 프레임에 직접 붙였는데**(입력 변형), 그 한 컬럼이 풀 전체 태그 텍스트를 파이썬
+        # 문자열로 한 벌 더 들고 있었다(그리고 호출부마다 drop 으로 뒤치다꺼리를 했다).
+        # 호출자가 미리 만들어 둔 컬럼이 있으면 그대로 쓴다(기존 계약 보존).
+        if 'tags_string' in df.columns:
+            tags = _arrow_values(df['tags_string'])
+            if tags is None:
+                tags = pa.array(df['tags_string'], from_pandas=True)  # NaN -> null (na=False 동치)
+        else:
+            tags = self._tags_array(df)
 
         def contains(keyword: str) -> np.ndarray:
             # 부분일치. pandas str.contains(re.escape(kw), regex=True) 와 동치.
-            return pc.fill_null(pc.match_substring(tags, keyword), False).to_numpy(zero_copy_only=False)
+            return _mask_to_numpy(pc.match_substring(tags, keyword))
 
         def contains_exact(keyword: str) -> np.ndarray:
             # 퍼펙트 매칭 = **태그 전체 일치**. 경계는 쉼표뿐이다.
@@ -90,7 +197,7 @@ class SearchEngine:
             #
             # 쉼표 주변 공백은 데이터에 섞여 있다(`a, b,c` 둘 다 나온다) - `\s*` 로 흡수한다.
             pattern = r'(^|,)\s*' + re.escape(keyword) + r'\s*(,|$)'
-            return pc.fill_null(pc.match_substring_regex(tags, pattern), False).to_numpy(zero_copy_only=False)
+            return _mask_to_numpy(pc.match_substring_regex(tags, pattern))
 
         def or_term(keyword: str) -> np.ndarray:
             """OR 그룹의 항 하나. `*tag` 는 **그룹 밖과 똑같이** 태그 전체일치로 읽는다.
@@ -167,47 +274,57 @@ class SearchEngine:
         return df[survivors]
 
     def search_in_file(self, file_path: str, search_params: Dict[str, Any]) -> Optional[pd.DataFrame]:
-        """단일 Parquet 파일 내에서 검색을 수행합니다."""
-        try:
-            df = pd.read_parquet(file_path, engine="pyarrow")
-        except Exception:
-            return None # 파일 읽기 실패 시 건너뛰기
+        """단일 Parquet 파일 내에서 검색을 수행합니다.
 
-        # 로드 시 인덱스 정규화: 원격 태그 아카이브 parquet 일부는 뒤섞인(때로 비유니크)
-        # int64 인덱스를 갖는다(실제 식별자는 'id' 컬럼). parquet 자체는 수정 불가(원격
-        # 로드)이므로 로드 단계에서 0..N-1 RangeIndex 로 리셋해 tags_string 이 행 단위로만
-        # 만들어지게 한다 — 비유니크 인덱스에서 서로 다른 행의 태그가 병합되던 결함
-        # (예: '2girls' 행이 '1girl' 검색에 매칭)을 로드 단계에서 차단.
-        if not isinstance(df.index, pd.RangeIndex):
-            df = df.reset_index(drop=True)
-
+        파일을 행 배치로 흘려 읽으며 배치마다 걸러 낸다. 모든 마스크가 행 단위라
+        배치 경계는 결과에 영향을 주지 않는다(통짜 읽기와 동치) — 대신 스캔이 잡고
+        있는 양이 '워커당 파일 한 통'에서 '워커당 배치 하나 + 살아남은 행'으로 준다.
+        """
         # 등급 필터링 - 최적화: 모든 등급이 선택된 경우 건너뛰기
         enabled_ratings = set()
         if search_params.get('rating_e'): enabled_ratings.add('e')
         if search_params.get('rating_q'): enabled_ratings.add('q')
         if search_params.get('rating_s'): enabled_ratings.add('s')
         if search_params.get('rating_g'): enabled_ratings.add('g')
+        rating_filtered = len(enabled_ratings) < 4
 
-        # 모든 등급이 선택되지 않은 경우만 필터링
-        if len(enabled_ratings) < 4:
-            df = df[df['rating'].isin(enabled_ratings)]
-            if df.empty:
-                return None
+        query = search_params.get('query')
+        exclude_query = search_params.get('exclude_query')
 
-        # 검색어가 있을 때만 tags_string 생성 (성능 최적화)
-        if search_params.get('query') or search_params.get('exclude_query'):
-            # 벡터화된 _build_tags_string 으로 매 검색마다 즉석 빌드(캐시 없음 -> 추가
-            # 메모리 0). df 는 등급 필터로 boolean mask 된 뷰일 수 있어 copy 후 부착.
-            df = df.copy()
-            df['tags_string'] = self._build_tags_string(df)
+        survivors: List[pd.DataFrame] = []
+        try:
+            for df in _iter_parquet_frames(file_path, self.BATCH_ROWS):
+                # 인덱스 정규화: 원격 태그 아카이브 parquet 일부는 뒤섞인(때로 비유니크)
+                # int64 인덱스를 갖는다(실제 식별자는 'id' 컬럼). parquet 자체는 수정
+                # 불가(원격 로드)이므로 읽는 단계에서 0..N-1 RangeIndex 로 리셋해 태그
+                # 텍스트가 행 단위로만 만들어지게 한다 — 비유니크 인덱스에서 서로 다른
+                # 행의 태그가 병합되던 결함(예: '2girls' 행이 '1girl' 검색에 매칭)을
+                # 읽는 단계에서 차단.
+                if not isinstance(df.index, pd.RangeIndex):
+                    df = df.reset_index(drop=True)
 
-            # 필터링 적용
-            filtered_df = self._apply_filters(df, search_params['query'], search_params['exclude_query'])
+                # 모든 등급이 선택되지 않은 경우만 필터링
+                if rating_filtered:
+                    df = df[df['rating'].isin(enabled_ratings)]
+                    if df.empty:
+                        continue
 
-            if filtered_df.empty:
-                return None
+                # 검색어가 있을 때만 태그 텍스트 생성 (성능 최적화)
+                if query or exclude_query:
+                    # _apply_filters 가 태그 텍스트를 Arrow 배열로만 들고 있으므로 프레임에
+                    # 컬럼을 붙이지 않는다 — 붙이기 위한 방어적 copy 도, 뒤이은 drop 도 없다.
+                    df = self._apply_filters(df, query, exclude_query)
+                    if df.empty:
+                        continue
+                    if 'tags_string' in df.columns:
+                        df = df.drop(columns=['tags_string'])
 
-            return filtered_df.drop(columns=['tags_string'])
-        else:
-            # 검색어가 없으면 필터링 없이 반환
-            return df
+                survivors.append(df)
+        except Exception:
+            return None # 파일 읽기 실패 시 건너뛰기
+
+        if not survivors:
+            return None
+        if len(survivors) == 1:
+            return survivors[0].reset_index(drop=True)
+        return pd.concat(survivors, ignore_index=True)
