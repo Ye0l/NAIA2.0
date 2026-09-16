@@ -12,6 +12,7 @@ import numpy as np
 
 from core.web_session_context import WebSessionContext
 from core.byte_budget_cache import ByteBudgetCache
+from core.parquet_chunk_loader import release_arrow_pool
 
 
 CUSTOM_PARQUET_SCOPE = "custom_parquet"
@@ -210,6 +211,12 @@ def filter_source_frame(
             mask &= frame["id"].isin(tag_ids)
         if ratings and "rating" in frame.columns:
             mask &= frame["rating"].isin(ratings)
+        if bool(mask.all()):
+            # 전 행 통과 - 검색 직후(등급 4종 전부 활성·태그필터 없음)의 기본 경로다.
+            # boolean take 는 이때도 수백만 행을 새 버퍼에 통째로 다시 쌓는다. 결과는
+            # frame.copy() 와 행·순서·인덱스까지 동일하고, Arrow 문자열 컬럼은 copy 가
+            # 불변 버퍼 공유라 반환 프레임은 여전히 호출자 소유의 독립 객체다.
+            return frame.copy()
         return frame[mask].copy()
     filtered = frame.copy()
     from core.search_engine import SearchEngine
@@ -296,9 +303,18 @@ def search_tag_archive_frame(
                         # Progress is best-effort; never fail the search on it.
                         pass
     frames = [r for r in results if r is not None and not getattr(r, "empty", True)]
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    try:
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+    finally:
+        # Each worker read a whole bucket file; only the matched rows survive.
+        # Without this the discarded buffers stay in PyArrow's allocator and the
+        # process keeps most of a gigabyte it no longer uses — search after
+        # search, which is how a long session walks into an OOM.
+        results.clear()
+        frames.clear()
+        release_arrow_pool()
 
 
 def apply_search_runtime_filters(context: WebSessionContext) -> dict[str, Any]:
