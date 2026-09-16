@@ -1,11 +1,21 @@
 import random
 import re
+from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+
+def _text_series(series: pd.Series) -> pd.Series:
+    # Do not expand millions of Arrow strings back into Python objects just to
+    # normalize ratings or reject empty prompts. Legacy/object inputs keep the
+    # old conversion behavior.
+    if isinstance(series.dtype, pd.StringDtype):
+        return series.fillna("nan")
+    return series.astype(str)
 
 
 def _has_prompt_text(value) -> bool:
@@ -52,7 +62,7 @@ class _SearchResultBucket:
     df: pd.DataFrame
     consumed_indices: set[int] = field(default_factory=set)
     valid_prompt_mask_cache: Optional[pd.Series] = None
-    random_pools_by_rating: Optional[dict[Optional[str], list[int]]] = None
+    random_pools_by_rating: Optional[dict[Optional[str], array]] = None
     rating_counts_cache: Optional[dict[str, int]] = None
 
     def __post_init__(self):
@@ -99,7 +109,7 @@ class _SearchResultBucket:
             return self.valid_prompt_mask_cache
         general = self.df["general"]
         mask = general.notna()
-        text = general.astype(str).str.strip()
+        text = _text_series(general).str.strip()
         mask &= text.ne("")
         mask &= ~text.str.lower().isin({"nan", "none", "null"})
         self.valid_prompt_mask_cache = mask
@@ -120,12 +130,12 @@ class _SearchResultBucket:
             return
 
         if "rating" not in self.df.columns:
-            self.random_pools_by_rating[None] = list(self.df.index[mask])
+            self.random_pools_by_rating[None] = array('q', self.df.index[mask])
             return
 
-        ratings = self.df.loc[mask, "rating"].astype(str).str.strip().str.lower()
+        ratings = _text_series(self.df.loc[mask, "rating"]).str.strip().str.lower()
         for rating, indices in ratings.groupby(ratings, sort=False).groups.items():
-            self.random_pools_by_rating[str(rating)] = list(indices)
+            self.random_pools_by_rating[str(rating)] = array('q', indices)
 
     def row_matches_random_filter(self, index: int, active_rating_keys: Optional[set[str]]) -> bool:
         if index in self.consumed_indices:
@@ -186,7 +196,7 @@ class _SearchResultBucket:
             return {r: 0 for r in "gsqe"}
         if self.rating_counts_cache is not None:
             return dict(self.rating_counts_cache)
-        ratings = self.remaining_dataframe()["rating"].astype(str).str.strip().str.lower()
+        ratings = _text_series(self.remaining_dataframe()["rating"]).str.strip().str.lower()
         counts = ratings.value_counts()
         self.rating_counts_cache = {r: int(counts.get(r, 0)) for r in "gsqe"}
         return dict(self.rating_counts_cache)
@@ -407,6 +417,16 @@ class SearchResultModel:
             yield first_bucket, frame
             return
 
+        # Archive-ordered results have contiguous bucket runs. Positional slices
+        # share Arrow buffers; boolean gathers copy every prompt string.
+        starts = np.r_[0, np.flatnonzero(bucket_ids[1:] != bucket_ids[:-1]) + 1]
+        run_ids = bucket_ids[starts]
+        if len(np.unique(run_ids)) == len(run_ids):
+            ends = np.r_[starts[1:], len(frame)]
+            for start, end, bucket_id in zip(starts, ends, run_ids):
+                yield int(bucket_id), frame.iloc[start:end].reset_index(drop=True)
+            return
+
         bucket_series = pd.Series(bucket_ids, index=frame.index)
         for bucket_id in pd.unique(bucket_ids):
             chunk = frame.loc[bucket_series == bucket_id].reset_index(drop=True)
@@ -595,7 +615,7 @@ class SearchResultModel:
         if self._rating_counts_cache is not None:
             return dict(self._rating_counts_cache)
         if self._pending_dataframe is not None:
-            ratings = self._pending_dataframe["rating"].astype(str).str.strip().str.lower()
+            ratings = _text_series(self._pending_dataframe["rating"]).str.strip().str.lower()
             rating_counts = ratings.value_counts()
             self._rating_counts_cache = {r: int(rating_counts.get(r, 0)) for r in "gsqe"}
             return dict(self._rating_counts_cache)
@@ -617,7 +637,7 @@ class SearchResultModel:
         if self._rating_counts_cache is not None and active_rating_keys is not None:
             return int(sum(self._rating_counts_cache.get(rating, 0) for rating in active_rating_keys))
         if self._pending_dataframe is not None and active_rating_keys is not None:
-            return int(self._pending_dataframe["rating"].astype(str).str.strip().str.lower().isin(active_rating_keys).sum())
+            return int(_text_series(self._pending_dataframe["rating"]).str.strip().str.lower().isin(active_rating_keys).sum())
         return int(sum(bucket.get_filtered_count(active_rating_keys) for bucket in self._buckets.values()))
 
     # [신규] 무작위 행을 추출하고 제거하는 메서드
@@ -708,7 +728,7 @@ class SearchResultModel:
 
             filtered = frame
             if active_rating_keys is not None and "rating" in filtered.columns:
-                ratings = filtered["rating"].astype(str).str.strip().str.lower()
+                ratings = _text_series(filtered["rating"]).str.strip().str.lower()
                 filtered = filtered[ratings.isin(active_rating_keys)]
             if filtered.empty:
                 continue
@@ -773,7 +793,7 @@ class SearchResultModel:
                 continue
             filtered = frame
             if active_rating_keys is not None and "rating" in filtered.columns:
-                ratings = filtered["rating"].astype(str).str.strip().str.lower()
+                ratings = _text_series(filtered["rating"]).str.strip().str.lower()
                 filtered = filtered[ratings.isin(active_rating_keys)]
             if filtered.empty:
                 continue
@@ -836,7 +856,7 @@ class SearchResultModel:
                 continue
             filtered = frame
             if active_rating_keys is not None and "rating" in filtered.columns:
-                ratings = filtered["rating"].astype(str).str.strip().str.lower()
+                ratings = _text_series(filtered["rating"]).str.strip().str.lower()
                 filtered = filtered[ratings.isin(active_rating_keys)]
             if filtered.empty:
                 continue
@@ -900,7 +920,7 @@ class SearchResultModel:
                 continue
             filtered = frame
             if active_rating_keys is not None and "rating" in filtered.columns:
-                ratings = filtered["rating"].astype(str).str.strip().str.lower()
+                ratings = _text_series(filtered["rating"]).str.strip().str.lower()
                 filtered = filtered[ratings.isin(active_rating_keys)]
             if filtered.empty:
                 continue

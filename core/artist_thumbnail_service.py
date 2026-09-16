@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
+from core.artist_thumbnail_store import ArtistThumbnailStore
+from core.byte_budget_cache import ByteBudgetCache
 import hashlib
 import importlib.util
 import io
@@ -102,8 +105,8 @@ class ArtistThumbnailService:
         self.legacy_state_root = self.repo_root / "artist_thumb"
         self.legacy_wildcards_root = self.repo_root / "wildcards"
         self._mode_getter = mode_getter or (lambda: "NAI")
-        self._data_cache: dict[str, dict] = {}
-        self._image_cache: dict[tuple[str, str], tuple[bytes, str]] = {}
+        self._data_cache: dict[str, Mapping] = {}
+        self._image_cache = ByteBudgetCache(32 * 1024 * 1024, 512, lambda item: len(item[0]))
         self._random_history: dict[tuple[str, str, str, int], list[str]] = {}
         self._lock = threading.RLock()
         self._download_thread: threading.Thread | None = None
@@ -505,9 +508,9 @@ class ArtistThumbnailService:
         temp_path.replace(path)
         return normalized
 
-    def _cache_entry_from_data(self, artist: str, mode: str, thumb_data: dict) -> dict | None:
+    def _cache_entry_from_data(self, artist: str, mode: str, thumb_data: Mapping) -> dict | None:
         artist_name = str(artist or "").strip()
-        if not artist_name or not isinstance(thumb_data, dict):
+        if not artist_name or not isinstance(thumb_data, Mapping):
             return None
         encoded_list = thumb_data.get(artist_name)
         if not isinstance(encoded_list, (list, tuple)) or not encoded_list:
@@ -521,7 +524,7 @@ class ArtistThumbnailService:
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
 
-    def sync_favorite_thumbnail_cache(self, mode: str = "", thumb_data: dict | None = None) -> dict:
+    def sync_favorite_thumbnail_cache(self, mode: str = "", thumb_data: Mapping | None = None) -> dict:
         mode_key = str(mode or "").strip()
         with self._lock:
             favorites = self._favorites()
@@ -542,7 +545,7 @@ class ArtistThumbnailService:
             if mode_key and thumb_data is None:
                 thumb_data = self._data_cache.get(mode_key)
 
-            if mode_key and isinstance(thumb_data, dict):
+            if mode_key and isinstance(thumb_data, Mapping):
                 for artist in missing_artists:
                     entry = self._cache_entry_from_data(artist, mode_key, thumb_data)
                     if entry:
@@ -599,7 +602,7 @@ class ArtistThumbnailService:
             self._write_thumbnail_cache({"version": 1, "items": items})
             return True
 
-    def load_data(self, mode: str) -> dict:
+    def load_data(self, mode: str) -> Mapping:
         key = str(mode or "").strip()
         if not key:
             return {}
@@ -617,9 +620,9 @@ class ArtistThumbnailService:
                 if file_state["needs_update"]:
                     raise RuntimeError(f"Artist thumbnail data needs update: {path}")
                 raise FileNotFoundError(f"Artist thumbnail data not found: {path}")
-            data = json.loads(self._mode_path(key).read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("Artist thumbnail data is invalid")
+            data = ArtistThumbnailStore(
+                self._mode_path(key), self.state_root / "thumbnail_index"
+            )
             self._data_cache.clear()
             self._image_cache.clear()
             self._data_cache[key] = data

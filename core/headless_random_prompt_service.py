@@ -829,7 +829,7 @@ class HeadlessRandomPromptService:
                     continue
                 progress, done = _new_progress()
                 try:
-                    frame = read_parquet_chunked(path, progress=progress)
+                    frame = read_parquet_chunked(path, progress=progress, compact_strings=True)
                     if self._should_skip_fallback_source(label, frame):
                         continue
                     if "rating" in frame.columns and label == "fallback parquet":

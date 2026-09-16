@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from core.web_session_context import WebSessionContext
+from core.byte_budget_cache import ByteBudgetCache
 
 
 CUSTOM_PARQUET_SCOPE = "custom_parquet"
@@ -629,7 +630,8 @@ def commit_pending_tag_filter_assignment(
         }
 
 
-_TAG_HITS_CAP = 4000  # 한 데이터셋 내 칩별 캐시 상한 (초과 시 비우고 lazy 재계산; tags_text는 유지)
+_TAG_HITS_CAP = 4000
+_TAG_HITS_MAX_BYTES = 64 * 1024 * 1024
 
 
 def _tag_filter_cache(context: WebSessionContext, snapshot) -> dict:
@@ -644,7 +646,9 @@ def _tag_filter_cache(context: WebSessionContext, snapshot) -> dict:
     """
     cache = getattr(context, "_tag_filter_cache", None)
     if cache is None or cache.get("snapshot") is not snapshot:
-        cache = {"snapshot": snapshot, "tags_text": None, "tag_hits": {}}
+        cache = {"snapshot": snapshot, "tags_text": None, "tag_hits": ByteBudgetCache(
+            _TAG_HITS_MAX_BYTES, _TAG_HITS_CAP, lambda mask: mask.nbytes
+        )}
         context._tag_filter_cache = cache
     return cache
 
@@ -768,8 +772,6 @@ def _run_tag_filter(context: WebSessionContext, snapshot, tags: list[Any], *, he
     row_count = cache["row_count"]
 
     def _store_mask(cache_key, mask):
-        if len(cache["tag_hits"]) >= _TAG_HITS_CAP:
-            cache["tag_hits"].clear()  # 메모리 상한 — tags_text 유지라 재계산 저렴
         cache["tag_hits"][cache_key] = mask
         return mask
 
@@ -938,7 +940,7 @@ def load_or_merge_custom_parquet(
     # the Tag/Tag-Filter lock + '풀 로딩 N%' (the frontend also locks on click).
     progress, done = make_search_load_progress(context)
     try:
-        frame = read_parquet_chunked(path, progress=progress)
+        frame = read_parquet_chunked(path, progress=progress, compact_strings=True)
         frame = normalize_custom_parquet_frame(frame)
         if merge:
             current = context.search_results.get_dataframe() if context.search_results else pd.DataFrame()

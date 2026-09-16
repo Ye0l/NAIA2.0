@@ -314,7 +314,7 @@ class HeadlessSearchStateService:
             from core.parquet_chunk_loader import read_parquet_chunked
             from core.search_result_model import SearchResultModel
 
-            frame = read_parquet_chunked(path, progress=progress)
+            frame = read_parquet_chunked(path, progress=progress, compact_strings=True)
             if frame is None or frame.empty:
                 return False
             # 컬럼 검증(Codex): 프롬프트 컬럼('general')이 없으면 검색 결과가 아닌 외부/손상 파일로

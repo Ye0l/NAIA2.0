@@ -51,3 +51,6 @@ uvicorn[standard]
 watchdog==6.0.0
 websocket-client
 zipp==3.23.0
+
+# Streaming import of multi-GB artist packs (shared backend).
+ijson>=3.3,<4

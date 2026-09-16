@@ -7,6 +7,7 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from core.seam_observer import seam_observer  # 관측 전용(기본 OFF) WS-command 계측
 
@@ -159,6 +160,8 @@ def register_websocket_session(
 
         async def _locked_send(message, *args, **kwargs):
             async with _send_lock:
+                if ws.application_state == WebSocketState.DISCONNECTED:
+                    raise WebSocketDisconnect(code=1000)
                 return await _raw_send(message, *args, **kwargs)
 
         ws.send = _locked_send  # type: ignore[method-assign]

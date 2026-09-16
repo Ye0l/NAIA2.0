@@ -67,12 +67,16 @@ def read_parquet_chunked(
     progress: Optional[ProgressCallback] = None,
     batch_rows: int = DEFAULT_BATCH_ROWS,
     columns: Optional[list[str]] = None,
+    compact_strings: bool = False,
 ) -> Any:
     """Read a parquet source (filesystem path, raw ``bytes``, or file-like) in
     row batches, returning one concatenated DataFrame.
 
-    Falls back to a plain ``pd.read_parquet`` if pyarrow batch iteration is
-    unavailable or the file has no row batches. ``progress(loaded, total)`` is
+    Legacy mode falls back to ``pd.read_parquet`` on reader failures. Compact
+    mode requires PyArrow and never retries a failed read with a whole-file
+    allocation. ``compact_strings`` uses shared Arrow UTF-8 buffers (missing
+    strings become NaN); other column types retain their normal conversion.
+    ``progress(loaded, total)`` is
     invoked after ``(0, total)`` and once per batch; callback errors are
     swallowed so a UI hiccup never fails the load.
     """
@@ -87,6 +91,8 @@ def read_parquet_chunked(
     try:
         import pyarrow.parquet as pq
     except Exception:
+        if compact_strings:
+            raise
         frame = _pd_read(path, columns)
         _tick(len(frame), len(frame))
         return frame
@@ -94,6 +100,8 @@ def read_parquet_chunked(
     try:
         parquet_file = pq.ParquetFile(_rewindable(path))
     except Exception:
+        if compact_strings:
+            raise
         frame = _pd_read(path, columns)
         _tick(len(frame), len(frame))
         return frame
@@ -101,19 +109,41 @@ def read_parquet_chunked(
     total = int(parquet_file.metadata.num_rows) if parquet_file.metadata is not None else 0
     _tick(0, total)
 
+    # Arrow-backed strings keep UTF-8 buffers shared across concatenation and
+    # snapshot copies instead of allocating a Python object per cell. Numeric
+    # and nested columns retain the existing conversion semantics.
+    mapper = None
+    if compact_strings:
+        import pandas as pd
+        import pyarrow as pa
+        import numpy as np
+
+        string_dtype = pd.StringDtype(storage="pyarrow", na_value=np.nan)
+
+        def mapper(dtype):
+            if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+                return string_dtype
+            return None
+
     frames: list[Any] = []
     loaded = 0
     try:
         iterator = (
             parquet_file.iter_batches(batch_size=batch_rows, columns=columns)
-            if columns
+            if columns is not None
             else parquet_file.iter_batches(batch_size=batch_rows)
         )
         for batch in iterator:
-            frames.append(batch.to_pandas())
+            frames.append(batch.to_pandas(types_mapper=mapper))
             loaded += batch.num_rows
             _tick(loaded, total or loaded)
+    except MemoryError:
+        # Retrying a whole-file read under memory pressure makes the peak worse.
+        raise
     except Exception:
+        if compact_strings:
+            raise
+        frames.clear()
         # Any mid-stream failure → fall back to the atomic read so callers still
         # get a correct frame (progress just won't be granular for the retry).
         frame = _pd_read(path, columns)
