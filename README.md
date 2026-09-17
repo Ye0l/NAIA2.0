@@ -366,6 +366,29 @@ class MyHook:
 바로 동작하며, `settings.json`으로 장수/방식을 조정합니다(재시작 불필요).
 구독·재귀 가드·enqueue·설정 영속까지 확장 API 전체를 시연하므로 새 확장의 출발점으로 쓰세요.
 
+### 샘플: 이미지 API 전송
+
+[`release_assets/samples/extensions/api_forwarder/`](release_assets/samples/extensions/api_forwarder/)
+— 생성이 끝난 이미지를 **임의의 HTTP 엔드포인트로 POST** 합니다. 아카이빙 서버, 웹훅
+프록시, 업스케일 파이프라인, 사내 갤러리처럼 "결과를 다른 데로도 보내고 싶다"는 용도.
+
+- **형식**: WebP(무손실 토글·품질) / PNG / JPEG / `original`(자동 저장된 파일 바이트
+  그대로 — 저장 전이면 PNG로 대체).
+- **메타데이터**: 포함 여부를 끄고 켭니다. 켜면 프롬프트·시드 등 NAI tEXt 청크를
+  요청 본문의 `metadata` 필드로 보내고, 별도 토글로 이미지 파일 자체에도 심습니다
+  (PNG=tEXt, WebP·JPEG=EXIF). 끄면 픽셀만 나갑니다.
+- **사용자 정의 값**: `이름=값` 행을 원하는 만큼 추가해 본문에 싣고, 헤더도 같은
+  방식(`Authorization: Bearer ...`)으로 붙입니다. 값에는 `{request_id}` `{seed}`
+  `{date}` 등 자리표시자를 쓸 수 있습니다.
+- **요청 형식**: multipart(파일 업로드) 또는 JSON(base64 본문). 재시도는 네트워크
+  오류·5xx·429 에만 겁니다.
+
+엔드포인트·헤더·타임아웃은 **Settings ▸ Extension**(scope global), 형식·메타데이터·
+사용자 정의 값은 **퀵 버튼 팝업**(scope module)에 나뉘어 노출됩니다 — 노출 계약 그대로.
+전송은 **Activate This Script**가 켜져 있을 때만 일어나고, **엔드포인트 테스트** 버튼은
+꺼져 있어도 눌립니다. `register_panel`의 scope 분리·조건부 표시·action 버튼과
+`get_result_image` 활용 예제이기도 합니다.
+
 ### 관리/문제해결
 
 - **끄기(개별)**: `<user-data>/config/extensions.json`에 `{"disabled": ["확장id"]}`
