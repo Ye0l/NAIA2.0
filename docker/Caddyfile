@@ -35,6 +35,18 @@
 	reverse_proxy 127.0.0.1:{$NAIA_APP_PORT:17243} {
 		header_up Host 127.0.0.1
 
+		# Drop X-Forwarded-For instead of passing the caller's address up.
+		# uvicorn runs ProxyHeadersMiddleware with proxy_headers=True and trusts
+		# 127.0.0.1 by default, which is exactly this proxy: given that header it
+		# REPLACES scope["client"] with the address inside it, for WebSocket
+		# connections as well as HTTP. Under a bridge network that address is the
+		# Docker gateway, so the backend would see 172.x.0.1 again and refuse
+		# token entry and the tag archive download — the very thing this proxy is
+		# here to fix. Nothing in NAIA reads the caller's address for any purpose
+		# other than that gate, and the trust boundary is the published port
+		# binding, so there is nothing to lose by removing it.
+		header_up -X-Forwarded-For
+
 		# Stream responses straight through. Generation and archive downloads
 		# report progress over long-lived connections; buffering stalls them.
 		flush_interval -1
