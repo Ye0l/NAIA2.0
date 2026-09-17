@@ -58,6 +58,43 @@ Get-Content  .\SHA256SUMS.txt
 업데이트: A/B(소스) 런처는 시작 시 새 커밋을 자동 확인하고 `git pull`을 제안합니다.
 Portable(C)은 앱 내 업데이트(다운로드+검증+재시작)를 지원합니다.
 
+### D. Docker (선택 — 셀프호스팅)
+
+Linux 호스트 기준입니다. A/B/C 중 어느 것도 Docker를 필요로 하지 않습니다
+(`PROJECT_LAYOUT_POLICY.md`의 Two Track Boundary).
+
+```bash
+cp .env.example .env
+sed -i "s/^NAIA_UID=.*/NAIA_UID=$(id -u)/; s/^NAIA_GID=.*/NAIA_GID=$(id -g)/" .env
+mkdir -p naia-data/{config,data,output,extensions,wildcards,save,logs,cache}
+docker compose up -d --build
+```
+
+브라우저에서 `http://127.0.0.1:7243` 을 엽니다. 첫 실행 시 태그 데이터(약 1.4GB)
+설치 화면이 나오는 것은 A/B/C와 같습니다.
+
+**마운트되는 것** — 앱이 쓰는 모든 경로는 `/data` 한 루트 아래 모입니다
+(`app/backend/runtime/paths.py:17`). compose는 그 루트를 마운트하고, 그중
+출력·확장·설정·와일드카드·프리셋·태그데이터는 개별 경로로도 재지정할 수 있게
+따로 뽑아 뒀습니다. 다른 디스크로 옮기려면 `.env`에서 해당 항목만 바꿉니다.
+
+기존 네이티브 설치를 그대로 이어받으려면 `.env`에서
+`NAIA_DATA_ROOT=~/.local/share/NAIA` 로 지정하면 토큰·태그·출력이 전부 이어집니다.
+
+**API 키** — NAI 토큰은 환경변수가 아니라 `config/secure_tokens.json`에 Fernet
+암호화되어 저장됩니다(`core/secure_token_manager.py`). 설정 디렉터리가 마운트되어
+있으므로 UI에서 한 번 입력하면 재시작해도 유지됩니다.
+
+> **⚠️ 공개 주소에 바로 노출하지 마세요.**
+> NAIA는 토큰 입력·태그 다운로드·확장 설치 같은 권한 있는 동작을 "요청이 이 기계에서
+> 왔는가"로 판정합니다(`install_manager_routes.py:47`, `websocket_session.py:294`).
+> 컨테이너 안에서는 리버스 프록시를 거치므로 **모든 요청이 로컬로 보입니다** — 그래서
+> Docker에서도 그 기능들이 동작하는 것이고, 동시에 앱이 더는 로컬/원격을 구분하지
+> 못한다는 뜻이기도 합니다. 그래서 compose는 공개 포트를 `127.0.0.1`에 묶어
+> **이 호스트에서만** 닿게 해 둡니다. `NAIA_BIND_ADDR=0.0.0.0` 으로 바꾸면 포트에
+> 도달할 수 있는 누구나 저장된 NAI 토큰과 확장 설치 권한을 갖습니다. 외부에 열어야
+> 한다면 앞단에 인증을 두세요. 자세한 내용은 `docker/Caddyfile` 주석에 있습니다.
+
 ---
 
 ## 저장소 구조 — 런타임 vs 개발/릴리스 인프라

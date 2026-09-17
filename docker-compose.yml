@@ -1,0 +1,66 @@
+# NAIA 2.0 — headless Remote Web in a container.
+#
+#   cp .env.example .env            # then edit if you want other paths
+#   mkdir -p naia-data/{config,data,output,extensions,wildcards,save,logs,cache}
+#   docker compose up -d --build
+#   open http://127.0.0.1:7243
+#
+# Optional release infrastructure. The supported clone path is still
+# `python NAIA_web_headless.py`; see PROJECT_LAYOUT_POLICY.md.
+
+name: naia
+
+services:
+  naia:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: naia2:local
+    container_name: naia
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+
+    # The mounted directories belong to your host user. `id -u` / `id -g` in .env.
+    user: "${NAIA_UID:-1000}:${NAIA_GID:-1000}"
+
+    # ⚠️ The bind address is the security boundary, not a convenience setting.
+    # Inside the container every request reaches the app as loopback (see
+    # docker/Caddyfile), which is what makes token entry, the tag archive
+    # download and extension install work at all under Docker — but it also
+    # means the app can no longer tell a local user from a remote one. Binding
+    # the published port to 127.0.0.1 keeps that decision honest: only this host
+    # can open the port. Setting NAIA_BIND_ADDR=0.0.0.0 gives full control of the
+    # app, including the stored NAI token, to anyone who can route to it.
+    ports:
+      - "${NAIA_BIND_ADDR:-127.0.0.1}:${NAIA_HOST_PORT:-7243}:7243"
+
+    environment:
+      NAIA_USER_DATA_DIR: /data
+      NAIA_HEADLESS_OPEN_BROWSER: "0"
+      NAIA_LOG_LEVEL: "${NAIA_LOG_LEVEL:-warning}"
+      # Ollama running on the host rather than in this container:
+      # NAIA_OLLAMA_URL: "http://host.docker.internal:11434"
+
+    # Lets the container reach services on the host by name (Ollama, a local
+    # WebUI/ComfyUI endpoint) instead of a hardcoded bridge address.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # Everything NAIA writes lives under one root: config, data, output,
+      # extensions, wildcards, save, logs, cache, downloads, bundles, ui_assets
+      # (app/backend/runtime/paths.py:17). Point NAIA_DATA_ROOT at an existing
+      # ~/.local/share/NAIA to carry over a native install as-is.
+      - "${NAIA_DATA_ROOT:-./naia-data}:/data"
+
+      # The individually relocatable ones, so a big output directory or a tag
+      # archive can live on another disk. Defaults land inside NAIA_DATA_ROOT,
+      # where they would be anyway.
+      - "${NAIA_OUTPUT_DIR:-./naia-data/output}:/data/output"
+      - "${NAIA_EXTENSIONS_DIR:-./naia-data/extensions}:/data/extensions"
+      - "${NAIA_CONFIG_DIR:-./naia-data/config}:/data/config"
+      - "${NAIA_WILDCARDS_DIR:-./naia-data/wildcards}:/data/wildcards"
+      - "${NAIA_SAVE_DIR:-./naia-data/save}:/data/save"
+      # The ~1.4GB tag archive and the bootstrap dictionaries.
+      - "${NAIA_TAGDATA_DIR:-./naia-data/data}:/data/data"
