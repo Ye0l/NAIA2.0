@@ -1,0 +1,9 @@
+{
+  "id": "api_forwarder",
+  "name": "이미지 API 전송",
+  "version": "1.0.0",
+  "naia_ext_api": 1,
+  "entry": "main.py",
+  "description": "생성된 이미지를 지정한 HTTP 엔드포인트로 전송 (WebP/PNG/JPEG·원본, 메타데이터 포함 선택, 사용자 정의 필드·헤더)",
+  "homepage": "https://github.com/DNT-LAB/NAIA2.0"
+}
