@@ -1,0 +1,86 @@
+# Build context for the headless web runtime image.
+# Boundary follows release_assets/manifests/release_include_exclude_draft.json:
+# anything listed there under exclude.development_only / exclude.local_runtime_state
+# is not part of the runnable product. data/tag_index, data/e621_data, the data/*.json
+# dictionaries and wildcards/ ARE tracked runtime content and must stay in.
+
+.git
+.gitignore
+.github
+.claude
+**/.claude
+.env
+.env.*
+!.env.example
+
+# Development and release-maintainer surfaces
+tests
+docs
+refactor_docs
+refactor_plans
+not_implement
+release_package
+mockups
+tools
+*.md
+**/*.md
+
+# Electron shell is a separate track; the web image never launches it
+app/electron/node_modules
+app/electron/grok-runtime/node_modules
+app/electron/dist
+app/electron/out
+app/electron/.cache
+
+# Python / editor cruft
+__pycache__
+**/__pycache__
+*.py[cod]
+.venv
+venv
+env
+ENV
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+.coverage.*
+htmlcov
+
+# Runtime state and downloaded assets: these live in the mounted volume,
+# never baked into the image (data/tags alone is ~1.4GB).
+logs
+output
+save
+temp
+tmp
+tmp_codex_*
+naia_headless_req_*
+user-data
+smoke-user-data
+naia-data
+_build
+NAIA-Portable
+NAIA-Web
+data/tags
+data/tagger
+data/character_thumbnails
+data/event_preset
+data/artist_thumbnail*.json
+utils/.cloudflared_bin
+**/.cloudflared_bin
+
+# Sample / debug leftovers
+temp_image.png
+test*.png
+manual_*.png
+*.xlsx
+*.naiv4vibe
+*.naiv4vibebundle
+naia_temp_rows.parquet
+
+# Docker's own files
+Dockerfile
+docker-compose.yml
+docker-compose.*.yml
+.dockerignore

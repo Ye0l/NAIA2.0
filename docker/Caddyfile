@@ -1,0 +1,42 @@
+# NAIA in-container reverse proxy.
+#
+# Why this exists: NAIA gates its privileged actions on the request coming from
+# the machine the app runs on. The HTTP gate requires BOTH the peer address and
+# the Host header to be loopback (app/backend/server/install_manager_routes.py:47),
+# and the WebSocket gate looks at the peer address alone
+# (app/backend/server/websocket_session.py:294). Under Docker's bridge network the
+# peer address is the network gateway (172.x.0.1), so token entry, the tag archive
+# download and extension install all answer 403 even for the person at the host.
+#
+# Caddy runs inside the container and dials the app over 127.0.0.1, so the app
+# sees a real loopback peer, and the Host header is pinned to match.
+#
+# IMPORTANT — where the trust boundary now lives: to the app, every request that
+# arrives through this proxy looks local. NAIA's own local/remote distinction is
+# therefore not doing any work here, and the WebSocket gate (NAI token entry,
+# account settings, cloudflared control) has no second factor to fall back on.
+# The boundary moves to Docker's port publishing instead: docker-compose.yml binds
+# the published port to the host's own loopback, so nothing off-box can open this
+# listener at all. Publishing it on 0.0.0.0 grants admin to anyone who can route
+# to the port — put real authentication in front of it before doing that.
+
+{
+	admin off
+	auto_https off
+	persist_config off
+	log {
+		output stderr
+		format console
+		level ERROR
+	}
+}
+
+:{$NAIA_PROXY_PORT:7243} {
+	reverse_proxy 127.0.0.1:{$NAIA_APP_PORT:17243} {
+		header_up Host 127.0.0.1
+
+		# Stream responses straight through. Generation and archive downloads
+		# report progress over long-lived connections; buffering stalls them.
+		flush_interval -1
+	}
+}
