@@ -784,6 +784,15 @@ class HeadlessRandomPromptService:
             safe_print(f"🌐 Headless Remote: search_results restored from memory snapshot ({self.context.search_results.get_count()} rows)")
             return True
 
+        # 탈출구: 풀이 이 기계에 안 들어가면 **앱이 아예 못 뜬다.** 복원은 기동 경로라
+        # 커널 OOM killer 가 프로세스를 SIGKILL 하면 파이썬은 손쓸 새도 없고, 컨테이너
+        # 재시작 정책이 그걸 무한 루프로 만든다(4.9M 행 풀에서 실제로 밟음). 이 스위치는
+        # 디스크 복원만 건너뛴다 — 앱은 빈 풀로 정상 기동하고, 사용자가 더 작은 풀을
+        # 불러오거나 검색을 새로 돌리면 된다. 메모리 스냅샷 복원은 위에서 이미 끝났다.
+        if os.environ.get("NAIA_SKIP_POOL_RESTORE", "").strip().lower() not in ("", "0", "false", "no", "off"):
+            safe_print("🌐 Headless Remote: pool restore skipped (NAIA_SKIP_POOL_RESTORE)")
+            return False
+
         # Disk restore — serialized. ``announce`` streams chunk progress to the
         # Remote Web clients (Tag/Tag-Filter lock + '풀 로딩 N%') so a large temp
         # pool no longer stalls startup as one opaque wait.

@@ -16,14 +16,33 @@ read from the file metadata up front (0 if unavailable), and is called once with
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from core.cpu_budget import pool_workers
 
 ProgressCallback = Callable[[int, int], None]
 
 # Rows per batch. 100k keeps each to_pandas() conversion short (frequent GIL
 # release / progress ticks) without fragmenting into thousands of tiny frames.
 DEFAULT_BATCH_ROWS = 100_000
+
+# Rows a compact load may hold mid-decode, across all threads. This is the knob
+# that trades pool-load time against peak memory: each row group in flight costs
+# roughly its uncompressed parquet size again as Arrow buffers plus the pandas
+# conversion. Measured on a 4,000,000-row pool in 1,048,576-row row groups
+# (253MiB uncompressed each), reading row groups instead of small batches took
+# 1.672s at 1.48 cores and a 2278MiB peak down to 1.391s at 1.55 cores and
+# 1948MiB — faster and smaller. Adding threads then buys speed with memory:
+# two row groups in flight 0.822s at 2.59 cores and 2592MiB, four 0.747s at
+# 3.01 cores and 2766MiB. The default allows two of those row groups.
+# Raise it with NAIA_POOL_LOAD_ROWS_IN_FLIGHT when the box has memory to spare.
+DEFAULT_ROWS_IN_FLIGHT = 2_000_000
+ROWS_IN_FLIGHT_ENV = "NAIA_POOL_LOAD_ROWS_IN_FLIGHT"
+# Ceiling on decode threads regardless of budget and core count.
+MAX_LOAD_WORKERS = 8
 
 
 def _rewindable(source: Any) -> Any:
@@ -103,6 +122,83 @@ def parquet_total_rows(source: Path | str | bytes) -> int:
         return 0
 
 
+def _rows_in_flight_budget() -> int:
+    raw = os.environ.get(ROWS_IN_FLIGHT_ENV, "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return DEFAULT_ROWS_IN_FLIGHT
+
+
+def _row_group_plan(parquet_file: Any, source: Any) -> tuple[int, int]:
+    """(row groups, decode threads) for a row-group read, or (0, 0) to stream.
+
+    Streaming stays the answer when a single row group is larger than the whole
+    in-flight budget — reading it whole would be the unbounded allocation this
+    module exists to avoid — and when the source is not a filesystem path, since
+    each worker needs its own reader and a BytesIO cannot be shared.
+    """
+    metadata = getattr(parquet_file, "metadata", None)
+    groups = int(getattr(metadata, "num_row_groups", 0) or 0)
+    if groups <= 0:
+        return 0, 0
+    try:
+        widest = max(metadata.row_group(i).num_rows for i in range(groups))
+    except Exception:
+        return 0, 0
+    budget = _rows_in_flight_budget()
+    if widest <= 0 or widest > budget:
+        return 0, 0
+    if not isinstance(source, str):
+        return groups, 1
+    return groups, pool_workers(min(groups, budget // widest), cap=MAX_LOAD_WORKERS)
+
+
+def _read_row_groups(
+    source: str,
+    parquet_file: Any,
+    groups: int,
+    workers: int,
+    columns: Optional[list[str]],
+    mapper: Any,
+    total: int,
+    tick: Callable[[int, int], None],
+) -> list[Any]:
+    """Decode row groups into frames, in order, optionally several at a time."""
+    import pyarrow.parquet as pq
+
+    frames: list[Any] = [None] * groups
+
+    def _one(index: int, handle: Any = None) -> Any:
+        # A ParquetFile is not safe to read from several threads, so each worker
+        # opens its own. The sequential path reuses the caller's handle.
+        reader = handle if handle is not None else pq.ParquetFile(source)
+        table = reader.read_row_group(index, columns=columns) if columns is not None \
+            else reader.read_row_group(index)
+        return table.to_pandas(types_mapper=mapper)
+
+    loaded = 0
+    if workers <= 1:
+        for index in range(groups):
+            frames[index] = _one(index, parquet_file)
+            loaded += len(frames[index])
+            tick(loaded, total or loaded)
+        return frames
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pool-load") as executor:
+        futures = {executor.submit(_one, index): index for index in range(groups)}
+        for future in as_completed(futures):
+            index = futures[future]
+            frames[index] = future.result()
+            loaded += len(frames[index])
+            tick(loaded, total or loaded)
+    return frames
+
+
 def read_parquet_chunked(
     path: Path | str | bytes,
     *,
@@ -139,8 +235,9 @@ def read_parquet_chunked(
         _tick(len(frame), len(frame))
         return frame
 
+    rewindable = _rewindable(path)
     try:
-        parquet_file = pq.ParquetFile(_rewindable(path))
+        parquet_file = pq.ParquetFile(rewindable)
     except Exception:
         if compact_strings:
             raise
@@ -155,6 +252,39 @@ def read_parquet_chunked(
     # snapshot copies instead of allocating a Python object per cell. Numeric
     # and nested columns retain the existing conversion semantics.
     mapper = compact_string_types_mapper() if compact_strings else None
+
+    # Whole row groups beat a stream of small batches on both axes — fewer,
+    # larger pieces to concatenate — and they are the unit that can be decoded on
+    # several threads. _row_group_plan declines when a row group would not fit
+    # the in-flight budget or the source cannot be reopened per worker, and the
+    # batch stream below stays the answer for those.
+    groups, workers = _row_group_plan(parquet_file, rewindable)
+    if groups > 0:
+        try:
+            frames = _read_row_groups(
+                rewindable, parquet_file, groups, workers, columns, mapper, total, _tick,
+            )
+        except MemoryError:
+            raise
+        except Exception:
+            if compact_strings:
+                raise
+            frame = _pd_read(path, columns)
+            _tick(len(frame), len(frame))
+            return frame
+        else:
+            frames = [frame for frame in frames if frame is not None]
+            if frames:
+                try:
+                    if len(frames) == 1:
+                        return frames[0].reset_index(drop=True)
+                    import pandas as pd
+
+                    return pd.concat(frames, ignore_index=True)
+                finally:
+                    frames.clear()
+                    if compact_strings:
+                        release_arrow_pool()
 
     frames: list[Any] = []
     loaded = 0
@@ -290,6 +420,8 @@ def make_search_load_progress(
 
 
 __all__ = [
+    "DEFAULT_ROWS_IN_FLIGHT",
+    "ROWS_IN_FLIGHT_ENV",
     "compact_string_types_mapper",
     "release_arrow_pool",
     "read_parquet_chunked",
