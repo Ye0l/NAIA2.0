@@ -34,6 +34,7 @@ import threading
 import time
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlparse
 
 FORMAT_WEBP = "webp"
 FORMAT_PNG = "png"
@@ -328,6 +329,38 @@ def _safe_filename(name, ext):
     return f"{cleaned}.{ext}" if ext else cleaned
 
 
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "::ffff:127.0.0.1"}
+
+
+def _in_container():
+    """컨테이너 안에서 도는가. localhost 의 의미가 달라지는 유일한 경우라 판별한다."""
+    try:
+        if Path("/.dockerenv").exists():
+            return True
+    except OSError:
+        pass
+    try:
+        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return any(marker in cgroup for marker in ("docker", "containerd", "kubepods"))
+
+
+def _endpoint_hint(url):
+    """실패 메시지에 덧붙일 한 줄 진단. 짚을 게 없으면 빈 문자열."""
+    try:
+        host = (urlparse(str(url or "")).hostname or "").lower()
+    except (ValueError, AttributeError):
+        return ""
+    if host in LOOPBACK_HOSTS and _in_container():
+        # 컨테이너 안의 localhost 는 호스트가 아니라 컨테이너 자신이다. 도커에서
+        # 가장 흔하게 밟는 함정이라 403/404/연결거부를 이걸로 오해하기 쉽다.
+        return ("힌트: 컨테이너 안에서 localhost 는 호스트가 아니라 컨테이너 자신입니다. "
+                "호스트에서 도는 서비스라면 host.docker.internal 을, 다른 컨테이너면 "
+                "그 서비스 이름을 쓰세요.")
+    return ""
+
+
 # ── 확장 본체 ────────────────────────────────────────────────────
 
 class ApiForwarder:
@@ -468,10 +501,15 @@ class ApiForwarder:
             filename, content_type, data,
         )
         size_kb = len(data) / 1024
+        url = str(settings.get("endpoint_url") or "").strip()
         if ok:
             self._report(True, f"이미지 API 전송 완료: {filename} ({size_kb:.0f}KB) — {message}")
         else:
-            self._report(False, f"이미지 API 전송 실패: {filename} — {message}")
+            # 어디로 무엇을 보내다 실패했는지까지 남긴다 — 응답 코드만으로는
+            # 받는 쪽이 거절한 건지 엉뚱한 곳을 겨눈 건지 구분이 안 된다.
+            hint = _endpoint_hint(url)
+            detail = f"이미지 API 전송 실패: {url} — {message}"
+            self._report(False, f"{detail} / {hint}" if hint else detail)
 
     def _post(self, settings, headers, base, fields, metadata,
               filename, content_type, data):
