@@ -11,7 +11,10 @@ from typing import Any
 import numpy as np
 
 from core.web_session_context import WebSessionContext
+from concurrent.futures import ThreadPoolExecutor
+
 from core.byte_budget_cache import ByteBudgetCache
+from core.cpu_budget import available_cpus, pool_workers
 from core.parquet_chunk_loader import release_arrow_pool
 
 
@@ -42,6 +45,15 @@ _POOL_LOADING_THRESHOLD = 200_000
 # to one batch of (per-column str + cat + lower) instead of holding the whole
 # pool's columns materialized at once, and yields a progress heartbeat per batch.
 _TAGS_TEXT_BATCH = 100_000
+# Tag matching is split across cores only when there is enough work to pay for
+# the split; below this many rows one kernel call is already the cheaper answer.
+_TAG_MATCH_MIN_ROWS_PER_WORKER = 100_000
+# Ceiling on match threads. The kernels are CPU-bound with no per-thread buffer,
+# so this only guards against pathological core counts, not memory.
+_TAG_MATCH_MAX_WORKERS = 32
+# Archive scan workers. Each holds one streamed row batch, so this caps the
+# transient far more than it caps parallelism.
+_ARCHIVE_SCAN_MAX_WORKERS = 16
 
 
 def search_pool_state_guard(context: WebSessionContext):
@@ -258,9 +270,8 @@ def search_tag_archive_frame(
     ratings: set[str],
     progress_callback: Any = None,
 ):
-    import os
     import pandas as pd
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import as_completed
     from core.search_engine import SearchEngine
 
     search_params = {
@@ -286,7 +297,9 @@ def search_tag_archive_frame(
     # sequential scan (as_completed itself is unordered; results[i] re-orders).
     results: list[Any] = [None] * total
     if sources:
-        max_workers = min(total, max(2, min(8, os.cpu_count() or 4)))
+        # Sized from the container's actual CPU share, not the host's core
+        # count. Capped because each worker holds one row batch while it filters.
+        max_workers = max(2, pool_workers(total, cap=_ARCHIVE_SCAN_MAX_WORKERS))
         step = max(1, total // 20)  # ~20 progress ticks
         completed = 0
         with ThreadPoolExecutor(
@@ -677,19 +690,76 @@ def _tag_filter_cache(context: WebSessionContext, snapshot) -> dict:
 # methods directly (tag_filter_search gating + build/match heartbeats).
 
 
+def _arrow_column(series):
+    """Underlying Arrow array of an Arrow-backed Series, else ``None``."""
+    return getattr(getattr(series, "array", None), "_pa_array", None)
+
+
+def _tags_text_arrow(frame, tag_columns: list[str]):
+    """Row-wise lowercased ``a,b,c`` tag text as one Arrow array, or ``None``.
+
+    Joining and lowercasing in Arrow is ~8x the pandas ``astype(str).str.cat``
+    pass on its own (3.04s -> 0.37s per million rows measured), and it leaves the
+    result in a shared UTF-8 buffer that the match kernels below can slice for
+    free. ``None`` when any tag column is not Arrow-backed, which sends the
+    caller back to the pandas path.
+    """
+    columns = []
+    for name in tag_columns:
+        values = _arrow_column(frame[name])
+        if values is None:
+            return None
+        columns.append(values)
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    target = pa.large_string()
+    filled = [
+        pc.fill_null(values if values.type == target else values.cast(target), "")
+        for values in columns
+    ]
+    if len(filled) == 1:
+        joined = filled[0]
+    else:
+        joined = pc.binary_join_element_wise(*filled, pa.scalar(",", type=target))
+    return pc.utf8_lower(joined)
+
+
 def _build_tags_text(frame, tag_columns: list[str], heartbeat=None):
-    """Build the per-row lowercased tag-text index in row-batches so the transient
-    peak is one batch of (per-column str + str.cat + str.lower) rather than the
-    whole pool's columns materialized at once. Result is identical to the single
-    pass ``parts[0].str.cat(parts[1:], sep=',').str.lower()`` — row order and
-    index labels are preserved (positional masks stay aligned to ``frame``).
-    ``heartbeat(loaded_rows, total_rows)`` is called per batch."""
+    """Build the per-row lowercased tag-text index.
+
+    Arrow-backed pools (everything the search path produces since the archive
+    scan started keeping UTF-8 buffers) join and lowercase in one C pass; object
+    columns keep the old row-batched ``astype(str).str.cat().str.lower()``. Both
+    return a Series whose row order and index labels match ``frame``, so the
+    positional masks built from it stay aligned. ``heartbeat(loaded, total)`` is
+    called per batch on the pandas path and once at the end on the Arrow path,
+    which is fast enough not to need re-arming partway.
+    """
     import pandas as pd
 
     n = len(frame)
     if n == 0:
         base = frame[tag_columns[0]].fillna("").astype(str)
         return base.str.lower()
+
+    try:
+        joined = _tags_text_arrow(frame, tag_columns)
+    except Exception:
+        joined = None
+    if joined is not None:
+        series = pd.Series(
+            pd.array(joined, dtype=pd.StringDtype(storage="pyarrow", na_value=np.nan)),
+            index=frame.index,
+            copy=False,
+        )
+        if heartbeat is not None:
+            try:
+                heartbeat(n, n)
+            except Exception:
+                pass
+        return series
+
     chunks = []
     for start in range(0, n, _TAGS_TEXT_BATCH):
         sl = slice(start, start + _TAGS_TEXT_BATCH)
@@ -702,6 +772,68 @@ def _build_tags_text(frame, tag_columns: list[str], heartbeat=None):
             except Exception:
                 pass
     return chunks[0] if len(chunks) == 1 else pd.concat(chunks)
+
+
+def _lower_like_index(tags_text, value: str) -> str:
+    """Lowercase a chip the way the index it will be matched against was.
+
+    ``pc.utf8_lower`` maps codepoint by codepoint while Python's ``str.lower``
+    applies contextual rules, so the two disagree on a handful of characters —
+    ``ΣΟΦΟΣ`` lowers to ``σοφοσ`` in Arrow and ``σοφος`` in Python, ``İ`` gains a
+    combining dot only in Python. Lowering the needle with one function and the
+    index with the other makes those tags silently unmatchable, so the needle
+    follows whichever built the index.
+    """
+    if _arrow_column(tags_text) is None:
+        return value.lower()
+    try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        return pc.utf8_lower(pa.scalar(value, type=pa.large_string())).as_py()
+    except Exception:
+        return value.lower()
+
+
+def _contains_mask(tags_text, needle: str, *, regex: bool):
+    """Row-wise substring/regex match -> numpy bool mask, spread over the cores.
+
+    pandas runs this on one core holding the GIL: 4.08s for an exact-match regex
+    over a million rows. The Arrow kernels release the GIL, so slicing the shared
+    buffer and matching the slices in a thread pool actually scales — the same
+    million rows come back in 0.12s across four cores. Object-dtype indexes (a
+    custom parquet that never went through the Arrow path) fall back to pandas.
+    """
+    values = _arrow_column(tags_text)
+    if values is None:
+        return tags_text.str.contains(needle, na=False, regex=regex).to_numpy()
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if isinstance(values, pa.ChunkedArray):
+        values = values.combine_chunks()
+        if isinstance(values, pa.ChunkedArray):
+            values = (
+                values.chunk(0) if values.num_chunks == 1
+                else pa.concat_arrays(values.chunks)
+            )
+
+    match = pc.match_substring_regex if regex else pc.match_substring
+
+    def _run(array):
+        return pc.fill_null(match(array, needle), False).to_numpy(zero_copy_only=False)
+
+    total = len(values)
+    workers = pool_workers(-(-total // _TAG_MATCH_MIN_ROWS_PER_WORKER), cap=_TAG_MATCH_MAX_WORKERS)
+    if workers <= 1:
+        return _run(values)
+
+    step = -(-total // workers)
+    slices = [values.slice(offset, min(step, total - offset)) for offset in range(0, total, step)]
+    with ThreadPoolExecutor(max_workers=len(slices), thread_name_prefix="tag-match") as executor:
+        parts = list(executor.map(_run, slices))
+    return np.concatenate(parts) if len(parts) > 1 else parts[0]
 
 
 def tag_filter_search(context: WebSessionContext, tags: list[Any]) -> dict[str, Any]:
@@ -805,7 +937,7 @@ def _run_tag_filter(context: WebSessionContext, snapshot, tags: list[Any], *, he
             return cached
         if not exact:
             return _store_mask(
-                cache_key, tags_text.str.contains(key, na=False, regex=False).to_numpy()
+                cache_key, _contains_mask(tags_text, key, regex=False)
             )
         # 퍼펙트 매칭: SEARCH(`core/search_engine.py` contains_exact)와 **같은 경계**를 쓴다 -
         # 쉼표뿐. 같은 `*tag` 가 화면마다 다른 뜻이 되는 것이 최악이라 의도적으로 복제한다.
@@ -823,16 +955,14 @@ def _run_tag_filter(context: WebSessionContext, snapshot, tags: list[Any], *, he
         base = cache["tag_hits"].get((False, key))
         if base is None:
             return _store_mask(
-                cache_key, tags_text.str.contains(pattern, na=False, regex=True).to_numpy()
+                cache_key, _contains_mask(tags_text, pattern, regex=True)
             )
         out = np.zeros(row_count, dtype=bool)
         candidates = np.flatnonzero(base)
         if candidates.size:
             # ⚠️ positional `.iloc` 이어야 한다. 커스텀 parquet 은 index 가 기본이 아닐 수 있어
             #    label 색인을 쓰면 엉뚱한 행을 본다.
-            hits = tags_text.iloc[candidates].str.contains(
-                pattern, na=False, regex=True
-            ).to_numpy()
+            hits = _contains_mask(tags_text.iloc[candidates], pattern, regex=True)
             out[candidates[hits]] = True
         return _store_mask(cache_key, out)
 
@@ -881,7 +1011,7 @@ def _run_tag_filter(context: WebSessionContext, snapshot, tags: list[Any], *, he
     exclude_mask = np.zeros(row_count, dtype=bool)
     for clean, negate, exact in parsed:
         _beat()                                          # 이 칩의 str.contains scan 직전
-        m = _hit_mask(clean.lower(), exact)
+        m = _hit_mask(_lower_like_index(tags_text, clean), exact)
         if negate:
             exclude_mask |= m
         elif include_mask is None:
