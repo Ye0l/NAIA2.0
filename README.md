@@ -383,8 +383,9 @@ class MyHook:
 ### 샘플: 이미지 API 전송
 
 [`release_assets/samples/extensions/api_forwarder/`](release_assets/samples/extensions/api_forwarder/)
-— 생성이 끝난 이미지를 **임의의 HTTP 엔드포인트로 POST** 합니다. 아카이빙 서버, 웹훅
-프록시, 업스케일 파이프라인, 사내 갤러리처럼 "결과를 다른 데로도 보내고 싶다"는 용도.
+— 생성이 끝난 이미지를 **임의의 HTTP 엔드포인트나 WebDAV 폴더로** 보냅니다. 아카이빙 서버, 웹훅
+프록시, 업스케일 파이프라인, 사내 갤러리, Nextcloud·NAS 같은 WebDAV 스토리지처럼
+"결과를 다른 데로도 보내고 싶다"는 용도.
 
 - **형식**: WebP(무손실 토글·품질) / PNG / JPEG / `original`(자동 저장된 파일 바이트
   그대로 — 저장 전이면 PNG로 대체).
@@ -394,8 +395,12 @@ class MyHook:
 - **사용자 정의 값**: `이름=값` 행을 원하는 만큼 추가해 본문에 싣고, 헤더도 같은
   방식(`Authorization: Bearer ...`)으로 붙입니다. 값에는 `{request_id}` `{seed}`
   `{date}` 등 자리표시자를 쓸 수 있습니다.
-- **요청 형식**: multipart(파일 업로드) 또는 JSON(base64 본문). 재시도는 네트워크
-  오류·5xx·429 에만 겁니다.
+- **요청 형식**: multipart(파일 업로드), JSON(base64 본문), WebDAV 중 고릅니다.
+  multipart·JSON은 HTTP 메서드(POST/PUT/PATCH)를 고를 수 있습니다. WebDAV는
+  `<엔드포인트>/<하위 폴더>/<파일>`로 이미지 바이트를 그대로 PUT 하고(하위 폴더는
+  `{date}/{api_mode}` 같은 템플릿), 없는 폴더는 MKCOL로 만들며, 메타데이터를 같은 이름의
+  `.json` 사이드카로 함께 올릴 수 있습니다. Basic 인증용 사용자 이름·비밀번호는
+  Settings ▸ Extension에 있습니다. 재시도는 네트워크 오류·5xx·429 에만 겁니다.
 
 엔드포인트·헤더·타임아웃은 **Settings ▸ Extension**(scope global), 형식·메타데이터·
 사용자 정의 값은 **퀵 버튼 팝업**(scope module)에 나뉘어 노출됩니다 — 노출 계약 그대로.

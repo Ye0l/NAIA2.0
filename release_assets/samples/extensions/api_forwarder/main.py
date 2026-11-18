@@ -1,8 +1,13 @@
 """이미지 API 전송 — NAIA Custom Extension (naia_ext_api=1).
 
 생성이 끝난 이미지를 임의의 HTTP 엔드포인트로 밀어 넣는다. 아카이빙 서버, 디스코드
-웹훅 프록시, 업스케일 파이프라인, 사내 갤러리 등 "결과를 다른 데로도 보내고 싶다"는
-용도 전반을 덮는다.
+웹훅 프록시, 업스케일 파이프라인, 사내 갤러리, WebDAV 스토리지(Nextcloud·NAS 등)
+등 "결과를 다른 데로도 보내고 싶다"는 용도 전반을 덮는다.
+
+- **요청 형식**: multipart(form-data) / json(base64 본문) / webdav. multipart·json 은
+  HTTP 메서드(POST/PUT/PATCH)를 고를 수 있다. webdav 는 ``<엔드포인트>/<폴더>/<파일>``
+  로 이미지 바이트를 그대로 PUT 하고, 없는 폴더는 MKCOL 로 만들며, 메타데이터는
+  같은 이름의 ``.json`` 사이드카로 옆에 올릴 수 있다.
 
 - **형식**: WebP(무손실 토글) / PNG / JPEG / 원본(저장된 파일 바이트 그대로).
 - **메타데이터**: 포함 여부를 끄고 켤 수 있다. 켜면 프롬프트·시드 등 NAI tEXt 청크를
@@ -43,6 +48,10 @@ FORMAT_ORIGINAL = "original"
 
 MODE_MULTIPART = "multipart"
 MODE_JSON = "json"
+MODE_WEBDAV = "webdav"
+PAYLOAD_MODES = (MODE_MULTIPART, MODE_JSON, MODE_WEBDAV)
+
+HTTP_METHODS = ("POST", "PUT", "PATCH")
 
 # 한 번에 들고 있을 전송 대기 수. 생성이 전송보다 빠를 때 메모리가 무한정 늘지
 # 않도록 막는다 — 넘치면 가장 오래된 것을 버리지 않고 새 것을 거절한다(로그+토스트).
@@ -78,9 +87,15 @@ DEFAULT_SETTINGS = {
     "timeout": 30,
     "retries": 2,
     "verify_tls": True,
+    "webdav_username": "",
+    "webdav_password": "",
     # ── 동작 (퀵 버튼 팝업) ─────────────────────────────────────
     "payload_mode": MODE_MULTIPART,
+    "http_method": "POST",
     "file_field": "file",
+    "webdav_dir": "{date}",
+    "webdav_create_dirs": True,
+    "webdav_sidecar": False,
     "image_format": FORMAT_WEBP,
     "webp_lossless": False,
     "quality": 90,
@@ -262,6 +277,16 @@ def _content_type(ext):
     }.get(str(ext).lower(), "application/octet-stream")
 
 
+def _payload_mode(settings):
+    mode = str(settings.get("payload_mode") or MODE_MULTIPART).strip().lower()
+    return mode if mode in PAYLOAD_MODES else MODE_MULTIPART
+
+
+def _http_method(settings):
+    method = str(settings.get("http_method") or "POST").strip().upper()
+    return method if method in HTTP_METHODS else "POST"
+
+
 def _clamp_int(value, low, high, fallback):
     try:
         return max(low, min(high, int(value)))
@@ -329,6 +354,29 @@ def _safe_filename(name, ext):
     return f"{cleaned}.{ext}" if ext else cleaned
 
 
+def _safe_segment(name):
+    """WebDAV 폴더 한 칸. 파일 이름과 같은 규칙이지만 확장자를 붙이지 않는다."""
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", str(name or "").strip()).strip("._-")[:120]
+
+
+def _webdav_dir_segments(template, values):
+    """``{date}/{api_mode}`` 같은 폴더 템플릿 → 안전한 경로 조각 목록.
+    빈 칸·``.``·``..`` 은 버려서 엔드포인트 밖으로 나가지 못하게 한다."""
+    expanded = _expand(template or "", values).replace("\\", "/")
+    return [seg for seg in (_safe_segment(part) for part in expanded.split("/")) if seg]
+
+
+def _webdav_url(base, segments):
+    """엔드포인트(컬렉션 URL) 뒤에 조각을 이어 붙인다. 조각은 이미 안전 문자만 남아
+    있지만 혹시 모를 문자를 위해 quote 한 번 더 거친다."""
+    from urllib.parse import quote
+
+    url = str(base or "").strip().rstrip("/")
+    for seg in segments:
+        url += "/" + quote(seg, safe="")
+    return url
+
+
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "::ffff:127.0.0.1"}
 
 
@@ -370,6 +418,9 @@ class ApiForwarder:
         self._worker = None
         self._worker_lock = threading.Lock()
         self._last_ok = None  # 성공/실패가 뒤집힐 때만 토스트를 띄우기 위한 상태
+        # MKCOL 로 이미 있음을 확인한 WebDAV 폴더 URL. 같은 날 폴더에 매 장 MKCOL 을
+        # 다시 던지지 않게 한다. 워커 스레드 하나만 만지므로 락은 필요 없다.
+        self._webdav_dirs = set()
 
     # -- 알림 -----------------------------------------------------
     def _log(self, message):
@@ -496,12 +547,19 @@ class ApiForwarder:
             "prompt_run_id": values["prompt_run_id"],
             "api_mode": values["api_mode"],
         }
-        ok, message = self._post(
-            settings, headers, base, fields, payload_metadata,
-            filename, content_type, data,
-        )
+        mode = _payload_mode(settings)
+        if mode == MODE_WEBDAV:
+            ok, message, url = self._webdav_upload(
+                settings, headers, values, base, fields, payload_metadata,
+                filename, content_type, data,
+            )
+        else:
+            ok, message = self._post(
+                settings, headers, base, fields, payload_metadata,
+                filename, content_type, data,
+            )
+            url = str(settings.get("endpoint_url") or "").strip()
         size_kb = len(data) / 1024
-        url = str(settings.get("endpoint_url") or "").strip()
         if ok:
             self._report(True, f"이미지 API 전송 완료: {filename} ({size_kb:.0f}KB) — {message}")
         else:
@@ -513,7 +571,7 @@ class ApiForwarder:
 
     def _post(self, settings, headers, base, fields, metadata,
               filename, content_type, data):
-        """재시도까지 포함한 1건 전송 → (성공여부, 사람이 읽을 메시지)."""
+        """multipart/json 1건 전송(재시도 포함) → (성공여부, 사람이 읽을 메시지)."""
         try:
             import requests
         except ImportError:
@@ -521,38 +579,47 @@ class ApiForwarder:
 
         url = str(settings.get("endpoint_url") or "").strip()
         timeout = _clamp_int(settings.get("timeout"), 1, 600, 30)
-        attempts = _clamp_int(settings.get("retries"), 0, 5, 2) + 1
         verify = bool(settings.get("verify_tls", True))
-        mode = str(settings.get("payload_mode") or MODE_MULTIPART).lower()
+        mode = _payload_mode(settings)
+        method = _http_method(settings)
 
+        def send():
+            if mode == MODE_JSON:
+                body = dict(base)
+                body.update(fields)
+                body["filename"] = filename
+                body["content_type"] = content_type
+                body["image_base64"] = base64.b64encode(data).decode("ascii")
+                if metadata is not None:
+                    body["metadata"] = metadata
+                return requests.request(
+                    method, url, json=body, headers=headers, timeout=timeout, verify=verify
+                )
+            form = dict(base)
+            form.update(fields)
+            if metadata is not None:
+                form["metadata"] = json.dumps(metadata, ensure_ascii=False)
+            field_name = str(settings.get("file_field") or "file").strip() or "file"
+            return requests.request(
+                method,
+                url,
+                data=form,
+                files={field_name: (filename, data, content_type)},
+                headers=headers,
+                timeout=timeout,
+                verify=verify,
+            )
+
+        return self._with_retry(settings, send)
+
+    def _with_retry(self, settings, send):
+        """``send()`` 를 재시도 정책대로 부른다 → (성공여부, 사람이 읽을 메시지).
+        네트워크 오류·5xx·429 만 다시 보내고, 그 밖의 4xx 는 즉시 포기한다."""
+        attempts = _clamp_int(settings.get("retries"), 0, 5, 2) + 1
         last = "알 수 없는 오류"
         for attempt in range(1, attempts + 1):
             try:
-                if mode == MODE_JSON:
-                    body = dict(base)
-                    body.update(fields)
-                    body["filename"] = filename
-                    body["content_type"] = content_type
-                    body["image_base64"] = base64.b64encode(data).decode("ascii")
-                    if metadata is not None:
-                        body["metadata"] = metadata
-                    response = requests.post(
-                        url, json=body, headers=headers, timeout=timeout, verify=verify
-                    )
-                else:
-                    form = dict(base)
-                    form.update(fields)
-                    if metadata is not None:
-                        form["metadata"] = json.dumps(metadata, ensure_ascii=False)
-                    field_name = str(settings.get("file_field") or "file").strip() or "file"
-                    response = requests.post(
-                        url,
-                        data=form,
-                        files={field_name: (filename, data, content_type)},
-                        headers=headers,
-                        timeout=timeout,
-                        verify=verify,
-                    )
+                response = send()
             except Exception as exc:
                 # 네트워크/TLS 오류는 재시도 대상. 예외 문자열에 헤더는 담기지 않는다.
                 last = f"{type(exc).__name__}: {exc}"
@@ -567,6 +634,83 @@ class ApiForwarder:
             if attempt < attempts:
                 time.sleep(min(8.0, 2.0 ** (attempt - 1)))
         return False, last
+
+    # -- WebDAV ---------------------------------------------------
+    def _webdav_upload(self, settings, headers, values, base, fields, metadata,
+                       filename, content_type, data):
+        """이미지를 PUT 하고, 켜져 있으면 메타데이터 사이드카(.json)도 옆에 올린다.
+        → (성공여부, 메시지, 이미지가 놓인 URL)."""
+        try:
+            import requests
+        except ImportError:
+            return False, "requests 를 불러올 수 없습니다 (본체 의존성 누락).", ""
+
+        endpoint = str(settings.get("endpoint_url") or "").strip()
+        timeout = _clamp_int(settings.get("timeout"), 1, 600, 30)
+        verify = bool(settings.get("verify_tls", True))
+        username = str(settings.get("webdav_username") or "").strip()
+        auth = (username, str(settings.get("webdav_password") or "")) if username else None
+        segments = _webdav_dir_segments(settings.get("webdav_dir"), values)
+        file_url = _webdav_url(endpoint, segments + [filename])
+
+        def request(method, url, **kwargs):
+            return requests.request(
+                method, url, auth=auth, timeout=timeout, verify=verify, **kwargs
+            )
+
+        if settings.get("webdav_create_dirs", True):
+            self._webdav_mkdirs(endpoint, segments, headers, request)
+
+        put_headers = dict(headers)
+        put_headers.setdefault("Content-Type", content_type)
+        ok, message = self._with_retry(
+            settings, lambda: request("PUT", file_url, data=data, headers=put_headers)
+        )
+        if not ok:
+            if message.startswith("HTTP 409"):
+                message = "HTTP 409 — 올릴 폴더가 없습니다 (‘없는 폴더 만들기’를 켜거나 엔드포인트 경로를 확인하세요)"
+            return ok, message, file_url
+        if not settings.get("webdav_sidecar"):
+            return ok, message, file_url
+
+        sidecar = dict(base)
+        sidecar.update(fields)
+        sidecar["filename"] = filename
+        sidecar["content_type"] = content_type
+        if metadata is not None:
+            sidecar["metadata"] = metadata
+        stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+        sidecar_url = _webdav_url(endpoint, segments + [f"{stem}.json"])
+        sidecar_headers = dict(headers)
+        sidecar_headers["Content-Type"] = "application/json; charset=utf-8"
+        body = json.dumps(sidecar, ensure_ascii=False, indent=2).encode("utf-8")
+        side_ok, side_message = self._with_retry(
+            settings, lambda: request("PUT", sidecar_url, data=body, headers=sidecar_headers)
+        )
+        if not side_ok:
+            # 이미지는 이미 올라갔다 — 사이드카만 실패한 것을 구분해서 알린다.
+            return False, f"이미지는 올렸지만 사이드카 실패 ({sidecar_url}): {side_message}", file_url
+        return True, f"{message} (+ 사이드카)", file_url
+
+    def _webdav_mkdirs(self, endpoint, segments, headers, request):
+        """엔드포인트 폴더부터 하위 폴더까지 한 칸씩 MKCOL. 201=만듦, 405=이미
+        있음 — 둘 다 성공으로 본다. 엔드포인트의 상위 경로는 건드리지 않는다.
+        실패해도 여기서 멈추지 않는다: 폴더가 정말 없으면 뒤따르는 PUT 이
+        409 로 떨어지며 그 메시지가 사용자에게 간다."""
+        for depth in range(0, len(segments) + 1):
+            url = _webdav_url(endpoint, segments[:depth]) + "/"
+            if url in self._webdav_dirs:
+                continue
+            try:
+                response = request("MKCOL", url, headers=dict(headers))
+            except Exception as exc:
+                self._log(f"WebDAV MKCOL 실패({url}): {type(exc).__name__}: {exc}")
+                return
+            if response.status_code in (200, 201, 204, 301, 405):
+                self._webdav_dirs.add(url)
+            else:
+                self._log(f"WebDAV MKCOL {url} → HTTP {response.status_code}")
+                return
 
     # -- 패널 액션 -------------------------------------------------
     def on_action(self, key):
@@ -619,6 +763,8 @@ def _register_panel(ctx, ext):
     if not hasattr(ctx, "register_panel"):
         return
     when_multipart = {"field": "payload_mode", "in": [MODE_MULTIPART]}
+    when_http = {"field": "payload_mode", "in": [MODE_MULTIPART, MODE_JSON]}
+    when_webdav = {"field": "payload_mode", "in": [MODE_WEBDAV]}
     when_lossy = {"field": "image_format", "in": [FORMAT_WEBP, FORMAT_JPEG]}
     when_webp = {"field": "image_format", "in": [FORMAT_WEBP]}
     # 렌더러는 현재 설정값을 String() 으로 눕혀 비교한다 — bool 은 "true"/"false".
@@ -630,7 +776,8 @@ def _register_panel(ctx, ext):
             {"key": "endpoint_url", "type": "text", "scope": "global",
              "default": "", "label": "엔드포인트 URL", "section": "전송 대상", "order": 0,
              "placeholder": "https://example.com/api/images",
-             "help": "이미지를 POST 할 주소. 비어 있으면 전송하지 않습니다"},
+             "help": "이미지를 보낼 주소. 비어 있으면 전송하지 않습니다. WebDAV 형식이면 "
+                     "올릴 폴더(컬렉션) URL — 예: https://cloud.example.com/remote.php/dav/files/me/NAIA"},
             {"key": "custom_headers", "type": "list", "scope": "global",
              "default": [], "label": "요청 헤더", "section": "전송 대상", "order": 1,
              "placeholder": "Authorization: Bearer xxxxx",
@@ -648,6 +795,14 @@ def _register_panel(ctx, ext):
              "default": True, "label": "TLS 인증서 검증", "section": "전송 대상", "order": 4,
              "help": "끄면 https 상대를 확인하지 않습니다. 사설 인증서를 쓰는 "
                      "내부망 엔드포인트가 아니라면 켜 두세요"},
+            {"key": "webdav_username", "type": "text", "scope": "global",
+             "default": "", "label": "WebDAV 사용자 이름", "section": "전송 대상", "order": 5,
+             "help": "요청 형식이 webdav 일 때만 씁니다. 비우면 Basic 인증을 붙이지 않습니다 "
+                     "(대신 요청 헤더에 Authorization 을 직접 넣어도 됩니다)"},
+            {"key": "webdav_password", "type": "text", "scope": "global",
+             "default": "", "label": "WebDAV 비밀번호", "section": "전송 대상", "order": 6,
+             "help": "Basic 인증 비밀번호. 화면에 평문으로 보이고 확장 설정 파일에 그대로 "
+                     "저장되므로 계정 비밀번호 대신 앱 비밀번호를 쓰세요"},
 
             # ── 동작: 퀵 버튼 팝업 (scope module) ───────────────────
             {"key": "image_format", "type": "select",
@@ -675,27 +830,48 @@ def _register_panel(ctx, ext):
                      "끄면 본문 필드로만 보내고 파일은 깨끗하게 유지"},
 
             {"key": "payload_mode", "type": "select",
-             "options": [MODE_MULTIPART, MODE_JSON],
+             "options": list(PAYLOAD_MODES),
              "default": MODE_MULTIPART, "label": "요청 형식",
              "column": "right", "section": "요청", "order": 30,
-             "help": "multipart = 파일 업로드(form-data) · json = base64 를 담은 JSON 본문"},
+             "help": "multipart = 파일 업로드(form-data) · json = base64 를 담은 JSON 본문 · "
+                     "webdav = 엔드포인트 폴더 아래에 파일을 그대로 PUT"},
+            {"key": "http_method", "type": "select", "options": list(HTTP_METHODS),
+             "default": "POST", "label": "HTTP 메서드",
+             "column": "right", "section": "요청", "order": 31,
+             "visible_when": when_http,
+             "help": "받는 쪽 API 가 기대하는 메서드. 대부분 POST"},
+            {"key": "webdav_dir", "type": "text", "default": "{date}",
+             "label": "WebDAV 하위 폴더", "column": "right", "section": "요청", "order": 33,
+             "visible_when": when_webdav, "placeholder": "{date}/{api_mode}",
+             "help": "엔드포인트 아래 폴더. ‘/’ 로 여러 단계, 비우면 엔드포인트 바로 아래. "
+                     "자리표시자는 사용자 정의 값과 같습니다"},
+            {"key": "webdav_create_dirs", "type": "bool", "default": True,
+             "label": "없는 폴더 만들기", "column": "right", "section": "요청", "order": 34,
+             "visible_when": when_webdav,
+             "help": "엔드포인트 폴더와 하위 폴더가 없으면 MKCOL 로 만듭니다 "
+                     "(엔드포인트보다 위 경로는 건드리지 않음)"},
+            {"key": "webdav_sidecar", "type": "bool", "default": False,
+             "label": "메타데이터 .json 함께 올리기", "column": "right", "section": "요청",
+             "order": 35, "visible_when": when_webdav,
+             "help": "같은 이름의 .json 파일에 request_id·사용자 정의 값과 "
+                     "(메타데이터 포함이 켜져 있으면) 생성 정보를 담아 옆에 올립니다"},
             {"key": "file_field", "type": "text", "default": "file",
-             "label": "파일 필드 이름", "column": "right", "section": "요청", "order": 31,
+             "label": "파일 필드 이름", "column": "right", "section": "요청", "order": 32,
              "visible_when": when_multipart, "placeholder": "file",
              "help": "multipart 파트 이름. 받는 쪽 API 가 기대하는 이름으로 맞추세요"},
             {"key": "filename_template", "type": "text", "default": "{request_id}",
-             "label": "파일 이름", "column": "right", "section": "요청", "order": 32,
+             "label": "파일 이름", "column": "right", "section": "요청", "order": 36,
              "placeholder": "{date}_{seed}",
              "help": "확장자는 전송 형식에 따라 자동으로 붙습니다"},
             {"key": "custom_fields", "type": "list", "default": [],
-             "label": "사용자 정의 값", "column": "right", "section": "요청", "order": 33,
+             "label": "사용자 정의 값", "column": "right", "section": "요청", "order": 37,
              "placeholder": "album=naia",
-             "help": "‘이름=값’ 한 줄에 하나. 본문에 그대로 실립니다. "
+             "help": "‘이름=값’ 한 줄에 하나. 본문에 그대로 실립니다(webdav 는 .json 사이드카에). "
                      "쓸 수 있는 자리표시자: {request_id} {prompt_run_id} {api_mode} "
                      "{seed} {steps} {scale} {sampler} {prompt} {software} "
                      "{ext} {timestamp} {date} {time}"},
             {"key": "test_send", "type": "action", "label": "▶ 엔드포인트 테스트",
-             "column": "right", "section": "요청", "order": 34,
+             "column": "right", "section": "요청", "order": 38,
              "help": "지금 설정으로 64×64 테스트 이미지를 한 장 보냅니다 "
                      "(작동 OFF 상태에서도 눌립니다)"},
         ],
