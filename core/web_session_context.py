@@ -116,6 +116,15 @@ class WebSessionContext:
         # lets each browser reject an older websocket payload that arrives after
         # a newer assignment/clear/consume transition from another tab.
         self._tag_filter_revision = 0
+        # Large search pools live in memory-mapped files under the runtime cache
+        # (core/pool_disk_store.py); NAIA_POOL_DISK_DIR still overrides.
+        if self.runtime_paths is not None:
+            try:
+                from core import pool_disk_store
+
+                pool_disk_store.configure(self.runtime_paths.cache_dir / "pool_spill")
+            except Exception:
+                pass
         initialize_web_session_context(self)
         # Pool-loading ownership (Tag/Tag-Filter lock + Random gate + toast). Both
         # the chunked parquet loader (LOAD phase) and the tag-filter index build /

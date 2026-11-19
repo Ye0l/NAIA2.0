@@ -16,6 +16,15 @@ from concurrent.futures import ThreadPoolExecutor
 from core.byte_budget_cache import ByteBudgetCache
 from core.cpu_budget import available_cpus, pool_workers
 from core.parquet_chunk_loader import release_arrow_pool
+from core.pool_disk_store import (
+    needs_spill,
+    share_frame,
+    spill_chunked_array,
+    spill_frame,
+    subset_frame,
+    take_frame,
+    wants_disk,
+)
 
 
 CUSTOM_PARQUET_SCOPE = "custom_parquet"
@@ -114,14 +123,14 @@ def rating_counts_from_frame(frame: Any) -> dict[str, int]:
 def search_base_frame(context: WebSessionContext):
     base = getattr(context, "search_results_master_base_snapshot", None)
     if base is not None and not getattr(base, "empty", True):
-        return base.copy()
+        return share_frame(base)
     snapshot = getattr(context, "search_results_snapshot", None)
     if snapshot is not None and not getattr(snapshot, "empty", True):
-        context.search_results_master_base_snapshot = snapshot.copy()
-        return snapshot.copy()
+        context.search_results_master_base_snapshot = share_frame(snapshot)
+        return share_frame(snapshot)
     if context.search_results is not None and not context.search_results.is_empty():
-        frame = context.search_results.get_dataframe().copy()
-        context.search_results_master_base_snapshot = frame.copy()
+        frame = share_frame(context.search_results.get_dataframe())
+        context.search_results_master_base_snapshot = share_frame(frame)
         return frame
     return None
 
@@ -133,8 +142,9 @@ def _dedup_by_id(frame):
     때만 행을 줄인다(주로 겹치는 custom parquet 합치기). 'cheap defense'."""
     try:
         if frame is not None and not getattr(frame, "empty", True) and "id" in frame.columns:
-            if frame["id"].duplicated().any():
-                return frame.drop_duplicates(subset="id", keep="first").reset_index(drop=True)
+            duplicated = frame["id"].duplicated(keep="first")
+            if duplicated.any():
+                return subset_frame(frame, ~duplicated, tag="dedup").reset_index(drop=True)
     except Exception:
         pass
     return frame
@@ -178,8 +188,8 @@ def reset_active_tag_filter_assignment(context: WebSessionContext) -> None:
 def install_custom_parquet_frame(context: WebSessionContext, frame) -> None:
     with search_pool_state_guard(context):
         context.search_results.set_dataframe(frame)
-        context.search_results_snapshot = context.search_results.get_dataframe().copy()
-        context.search_results_master_base_snapshot = context.search_results_snapshot.copy()
+        context.search_results_snapshot = share_frame(context.search_results.get_dataframe())
+        context.search_results_master_base_snapshot = share_frame(context.search_results_snapshot)
         context.search_results_scope = CUSTOM_PARQUET_SCOPE
         mark_search_pool_replaced(context)
         _reset_active_tag_filter_assignment(context)
@@ -228,9 +238,11 @@ def filter_source_frame(
             # boolean take 는 이때도 수백만 행을 새 버퍼에 통째로 다시 쌓는다. 결과는
             # frame.copy() 와 행·순서·인덱스까지 동일하고, Arrow 문자열 컬럼은 copy 가
             # 불변 버퍼 공유라 반환 프레임은 여전히 호출자 소유의 독립 객체다.
-            return frame.copy()
-        return frame[mask].copy()
-    filtered = frame.copy()
+            return share_frame(frame)
+        # 대형 풀은 매칭 행을 청크 단위로 디스크(mmap)에 모은다 — 부분집합이 RAM 에
+        # 통째로 다시 쌓이지 않는다(core/pool_disk_store.py).
+        return subset_frame(frame, mask)
+    filtered = share_frame(frame)
     from core.search_engine import SearchEngine
 
     engine = SearchEngine()
@@ -244,7 +256,7 @@ def filter_source_frame(
         filtered = filtered[filtered["id"].isin(tag_ids)]
     if ratings and "rating" in filtered.columns:
         filtered = filtered[filtered["rating"].isin(ratings)]
-    return filtered.copy()
+    return spill_frame(filtered) if needs_spill(filtered) else filtered.copy()
 
 
 def tag_archive_parquet_sources(context: WebSessionContext) -> list[tuple[Path, str]]:
@@ -260,6 +272,12 @@ def tag_archive_parquet_sources(context: WebSessionContext) -> list[tuple[Path, 
         for path in sorted(tag_dir.glob("tags_*.parquet"), key=_tag_archive_sort_key)
         if path.is_file()
     ]
+
+
+_PENDING = object()
+# Rows gathered before a run of archive-search results is written to its own
+# mapped file. Larger runs mean fewer files; smaller runs a lower heap peak.
+_ARCHIVE_SPILL_RUN_ROWS = 262_144
 
 
 def search_tag_archive_frame(
@@ -295,7 +313,47 @@ def search_tag_archive_frame(
     total = len(sources)
     # Collect by source index so the concatenated frame order is identical to a
     # sequential scan (as_completed itself is unordered; results[i] re-orders).
-    results: list[Any] = [None] * total
+    results: list[Any] = [_PENDING] * total
+    # Finished results are drained in source order into ``parts``. Once the
+    # drained rows reach the disk threshold every further run of ~1M rows is
+    # written to its own mapped file, so a broad search ("1girl") never holds
+    # its whole result on the heap — only the files still in flight plus one
+    # unflushed run. Each part is a complete file: a failed write leaves the
+    # earlier parts intact and the run simply stays in RAM.
+    parts: list[Any] = []
+    run: list[Any] = []
+    state = {"next": 0, "run_rows": 0, "rows": 0, "spilled": False}
+
+    def _flush(final: bool = False) -> None:
+        if not run:
+            return
+        if not (state["spilled"] or wants_disk(state["rows"])):
+            return
+        if not final and state["run_rows"] < _ARCHIVE_SPILL_RUN_ROWS:
+            return
+        block = run[0] if len(run) == 1 else pd.concat(run, ignore_index=True)
+        spilled = spill_frame(block, tag="search", force=True)
+        run.clear()
+        state["run_rows"] = 0
+        if spilled is not None:
+            state["spilled"] = True
+            parts.append(spilled)
+        else:
+            parts.append(block)
+        release_arrow_pool()
+
+    def _drain() -> None:
+        while state["next"] < total and results[state["next"]] is not _PENDING:
+            frame = results[state["next"]]
+            results[state["next"]] = None
+            state["next"] += 1
+            if frame is None or getattr(frame, "empty", True):
+                continue
+            run.append(frame)
+            state["run_rows"] += len(frame)
+            state["rows"] += len(frame)
+            _flush()
+
     if sources:
         # Sized from the container's actual CPU share, not the host's core
         # count. Capped because each worker holds one row batch while it filters.
@@ -307,7 +365,17 @@ def search_tag_archive_frame(
         ) as executor:
             future_to_index = {executor.submit(_search_one, item): i for i, item in enumerate(sources)}
             for future in as_completed(future_to_index):
-                results[future_to_index[future]] = future.result()
+                # pop, not index: a Future keeps its result alive, and the map
+                # held every finished file's frame until the whole scan ended —
+                # the full result on the heap even after it had gone to disk.
+                results[future_to_index.pop(future)] = future.result()
+                future = None
+                _drain()
+                if state["spilled"]:
+                    # Each finished file leaves its decode buffers behind in the
+                    # Arrow allocator; once results go to disk, hand them back
+                    # per file or the heap still climbs to the whole result.
+                    release_arrow_pool()
                 completed += 1
                 if progress_callback is not None and (completed % step == 0 or completed == total):
                     try:
@@ -315,10 +383,16 @@ def search_tag_archive_frame(
                     except Exception:
                         # Progress is best-effort; never fail the search on it.
                         pass
-    frames = [r for r in results if r is not None and not getattr(r, "empty", True)]
+    _drain()
+    _flush(final=True)
+    frames = parts + run
     try:
         if not frames:
             return pd.DataFrame()
+        if len(frames) == 1:
+            return frames[0].reset_index(drop=True)
+        # Arrow string columns concatenate as chunk lists (no copy), so a frame
+        # built from mapped parts stays on disk.
         return pd.concat(frames, ignore_index=True)
     finally:
         # Each worker read a whole bucket file; only the matched rows survive.
@@ -327,6 +401,8 @@ def search_tag_archive_frame(
         # search, which is how a long session walks into an OOM.
         results.clear()
         frames.clear()
+        parts.clear()
+        run.clear()
         release_arrow_pool()
 
 
@@ -335,7 +411,7 @@ def apply_search_runtime_filters(context: WebSessionContext) -> dict[str, Any]:
     if source is None or getattr(source, "empty", True):
         source = search_base_frame(context)
         if source is not None and not getattr(source, "empty", True):
-            context.search_results_snapshot = source.copy()
+            context.search_results_snapshot = share_frame(source)
             source = context.search_results_snapshot
     active_ids = getattr(context, "active_tag_filter_ids", None)
     # B3: assign 직후엔 tag_filter_search 가 이미 슬라이스한 매칭 프레임(등급-무관)을 재사용해
@@ -353,12 +429,28 @@ def apply_search_runtime_filters(context: WebSessionContext) -> dict[str, Any]:
         and reuse_for is active_ids
         and source is not None
         and reuse_snap is source
+        and isinstance(reuse_frame, MatchedRows)
+    ):
+        # 태그필터 매칭 위치 + 등급을 합쳐 최종 풀을 **한 번만** 만든다(대형 풀은 디스크로).
+        ratings = context.get_active_ratings()
+        positions = reuse_frame.positions
+        base_frame = reuse_frame.frame
+        if ratings and "rating" in base_frame.columns and len(positions):
+            keep = base_frame["rating"].iloc[positions].isin(ratings).to_numpy(dtype=bool)
+            positions = positions[keep]
+        filtered = take_frame(base_frame, positions, tag="tag-filter")
+    elif (
+        reuse_frame is not None
+        and active_ids is not None
+        and reuse_for is active_ids
+        and source is not None
+        and reuse_snap is source
     ):
         ratings = context.get_active_ratings()
         if ratings and "rating" in reuse_frame.columns:
-            filtered = reuse_frame[reuse_frame["rating"].isin(ratings)].copy()
+            filtered = subset_frame(reuse_frame, reuse_frame["rating"].isin(ratings))
         else:
-            filtered = reuse_frame.copy()
+            filtered = share_frame(reuse_frame)
     else:
         filtered = filter_source_frame(
             source,
@@ -544,8 +636,8 @@ def run_search_command(
         searched = _dedup_by_id(searched)
         with search_pool_state_guard(context):
             context.search_results.set_dataframe(searched)
-            context.search_results_snapshot = searched.copy()
-            context.search_results_master_base_snapshot = searched.copy()
+            context.search_results_snapshot = share_frame(searched)
+            context.search_results_master_base_snapshot = share_frame(searched)
             context.search_results_scope = TAG_ARCHIVE_SCOPE
             mark_search_pool_replaced(context)
             _reset_active_tag_filter_assignment(context)
@@ -559,7 +651,7 @@ def run_search_command(
         return context.search_state_payload()
     searched = _dedup_by_id(filter_source_frame(base, query=query, exclude=exclude, ratings=ratings))
     with search_pool_state_guard(context):
-        context.search_results_snapshot = searched.copy() if searched is not None else None
+        context.search_results_snapshot = share_frame(searched) if searched is not None else None
         mark_search_pool_replaced(context)
         _reset_active_tag_filter_assignment(context)
         context.save_search_filter_state(tag_filter_active=False)
@@ -572,11 +664,11 @@ def restore_search_snapshot(context: WebSessionContext) -> dict[str, Any]:
     base = search_base_frame(context)
     if base is not None:
         with search_pool_state_guard(context):
-            context.search_results_snapshot = base.copy()
+            context.search_results_snapshot = share_frame(base)
             mark_search_pool_replaced(context)
             _reset_active_tag_filter_assignment(context)
             context.save_search_filter_state(tag_filter_active=False)
-            context.search_results.set_dataframe(base.copy())
+            context.search_results.set_dataframe(share_frame(base))
     return search_state_with_runner_save(context)
 
 
@@ -659,6 +751,36 @@ def commit_pending_tag_filter_assignment(
         }
 
 
+_TAGS_TEXT_DISK_CHUNK = 262_144
+
+
+class MatchedRows:
+    """Rows of ``frame`` a tag filter matched, held as positions.
+
+    Stands in for the matched DataFrame between a tag-filter search and its
+    assignment: a search runs on every chip edit and only an assignment needs
+    real rows, so building them per search was a full-pool copy each time.
+    """
+
+    __slots__ = ("frame", "positions")
+
+    def __init__(self, frame, positions):
+        self.frame = frame
+        self.positions = np.asarray(positions, dtype=np.int64)
+
+    def __len__(self) -> int:
+        return int(len(self.positions))
+
+    @property
+    def columns(self):
+        return self.frame.columns
+
+    @property
+    def empty(self) -> bool:
+        return len(self.positions) == 0
+
+    def to_frame(self):
+        return take_frame(self.frame, self.positions, tag="tag-filter")
 _TAG_HITS_CAP = 4000
 _TAG_HITS_MAX_BYTES = 64 * 1024 * 1024
 
@@ -695,7 +817,7 @@ def _arrow_column(series):
     return getattr(getattr(series, "array", None), "_pa_array", None)
 
 
-def _tags_text_arrow(frame, tag_columns: list[str]):
+def _tags_text_arrow(frame, tag_columns: list[str], *, start: int = 0, stop: int | None = None):
     """Row-wise lowercased ``a,b,c`` tag text as one Arrow array, or ``None``.
 
     Joining and lowercasing in Arrow is ~8x the pandas ``astype(str).str.cat``
@@ -709,6 +831,9 @@ def _tags_text_arrow(frame, tag_columns: list[str]):
         values = _arrow_column(frame[name])
         if values is None:
             return None
+        if start or stop is not None:
+            end = len(values) if stop is None else min(stop, len(values))
+            values = values.slice(start, max(0, end - start))
         columns.append(values)
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -743,10 +868,28 @@ def _build_tags_text(frame, tag_columns: list[str], heartbeat=None):
         base = frame[tag_columns[0]].fillna("").astype(str)
         return base.str.lower()
 
-    try:
-        joined = _tags_text_arrow(frame, tag_columns)
-    except Exception:
-        joined = None
+    joined = None
+    if wants_disk(n) and all(_arrow_column(frame[c]) is not None for c in tag_columns):
+        # 대형 풀: 인덱스를 행 청크로 만들어 곧장 디스크(mmap)에 쓴다. 인덱스는
+        # 태그 텍스트 전체의 소문자 사본이라 RAM 에 두면 풀 하나를 더 쥐는 셈이고,
+        # 만드는 동안엔 그 두 배가 잡힌다(200만 행 실측 +0.9GiB 상주, +2GiB 순간).
+        try:
+            joined = spill_chunked_array(
+                (
+                    _tags_text_arrow(frame, tag_columns, start=lo, stop=lo + _TAGS_TEXT_DISK_CHUNK)
+                    for lo in range(0, n, _TAGS_TEXT_DISK_CHUNK)
+                ),
+                tag="tags-text",
+            )
+        except Exception:
+            joined = None
+        if joined is not None and len(joined) != n:
+            joined = None
+    if joined is None:
+        try:
+            joined = _tags_text_arrow(frame, tag_columns)
+        except Exception:
+            joined = None
     if joined is not None:
         series = pd.Series(
             pd.array(joined, dtype=pd.StringDtype(storage="pyarrow", na_value=np.nan)),
@@ -811,13 +954,12 @@ def _contains_mask(tags_text, needle: str, *, regex: bool):
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    if isinstance(values, pa.ChunkedArray):
-        values = values.combine_chunks()
-        if isinstance(values, pa.ChunkedArray):
-            values = (
-                values.chunk(0) if values.num_chunks == 1
-                else pa.concat_arrays(values.chunks)
-            )
+    # Chunked indexes are matched as they are: ``ChunkedArray.slice`` is zero-copy
+    # across chunk boundaries and the kernels accept chunked input. Combining the
+    # chunks first copied the whole index into one heap buffer on every chip —
+    # for a disk-backed index, the very copy the mapping exists to avoid.
+    if isinstance(values, pa.ChunkedArray) and values.num_chunks == 1:
+        values = values.chunk(0)
 
     match = pc.match_substring_regex if regex else pc.match_substring
 
@@ -849,7 +991,7 @@ def _tag_filter_search_impl(context: WebSessionContext, tags: list[Any]) -> dict
         if snapshot is None or getattr(snapshot, "empty", True):
             snapshot = search_base_frame(context)
             if snapshot is not None:
-                context.search_results_snapshot = snapshot.copy()
+                context.search_results_snapshot = share_frame(snapshot)
                 snapshot = context.search_results_snapshot
         source_generation = current_search_pool_generation(context)
     normalized = WebSessionContext.normalize_filter_tags(tags)
@@ -904,7 +1046,7 @@ def _run_tag_filter(context: WebSessionContext, snapshot, tags: list[Any], *, he
             if cache["tags_text"] is None:
                 tag_columns = [c for c in ("copyright", "character", "artist", "meta", "general") if c in snapshot.columns]
                 if not tag_columns:
-                    frame = snapshot.copy()
+                    frame = share_frame(snapshot)
                     frame["general"] = ""
                     tag_columns = ["general"]
                 else:
@@ -1024,13 +1166,22 @@ def _run_tag_filter(context: WebSessionContext, snapshot, tags: list[Any], *, he
     final_mask = include_mask & ~exclude_mask if exclude_mask.any() else include_mask
 
     frame = cache["frame"]
-    matched = frame[final_mask]                           # positional boolean index (set(range())/sorted() 제거)
-    ids = set(matched["id"].tolist()) if cache["has_id"] else set(matched.index.tolist())
+    # 매칭 행은 **위치만** 들고 있는다. 칩을 바꿀 때마다 도는 미리보기 검색이라, 여기서 프레임을
+    # 만들면 매번 풀 하나를 복사(RAM)하거나 디스크에 쓰는(대형 풀 실측 2s→5.6s) 셈이다. 실제 행은
+    # 할당(assign) 때 등급 필터까지 한 번에 적용해 한 번만 만든다(apply_search_runtime_filters).
+    matched = MatchedRows(frame, np.flatnonzero(final_mask))
+    positions = matched.positions
+    ids = (
+        set(frame["id"].iloc[positions].tolist())
+        if cache["has_id"]
+        else set(frame.index[positions].tolist())
+    )
+    rating_frame = frame[["rating"]].iloc[positions] if "rating" in frame.columns else frame.iloc[:0]
     return {
         "type": "tag_filter_result",
         "count": int(len(matched)),
         "tags": clean_tags,
-        "rating_counts": rating_counts_from_frame(matched),
+        "rating_counts": rating_counts_from_frame(rating_frame) if len(positions) else rating_counts_from_frame(None),
         "_ids": ids,
         # B3: 이미 슬라이스된 매칭 프레임(등급-무관)을 동봉 → assign 이 active 로 이관해
         # apply_search_runtime_filters 가 전체 스냅샷 isin 재스캔을 건너뛴다(가드는 호출부).

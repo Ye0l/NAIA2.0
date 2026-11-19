@@ -15,6 +15,7 @@ from app.backend.server.search_runtime import (
     search_pool_state_guard,
 )
 from core.web_session_context import WebSessionContext
+from core.pool_disk_store import needs_spill, share_frame, spill_frame
 
 
 AsyncRunner = Callable[..., Awaitable[Any]]
@@ -171,7 +172,7 @@ def apply_depth_filters(frame: Any, command: dict[str, Any]):
         filtered = filtered[filtered["character"].fillna("").astype(str).str.strip() != ""]
     if filters.get("only_empty_char") and "character" in filtered.columns:
         filtered = filtered[filtered["character"].fillna("").astype(str).str.strip() == ""]
-    return filtered.copy()
+    return spill_frame(filtered) if needs_spill(filtered) else filtered.copy()
 
 
 def handle_depth_action(context: WebSessionContext, command: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -186,8 +187,8 @@ def handle_depth_action(context: WebSessionContext, command: dict[str, Any]) -> 
         if base is None or getattr(base, "empty", True):
             return {"type": "depth_state", "open": False, "error": "no_search_results"}, None
         context.depth_state = {
-            "original": base.copy(),
-            "current": base.copy(),
+            "original": share_frame(base),
+            "current": share_frame(base),
             "query": "",
             "exclude": "",
             "ratings": {rating: True for rating in "eqsg"},
@@ -198,10 +199,10 @@ def handle_depth_action(context: WebSessionContext, command: dict[str, Any]) -> 
     if action == "refresh_from_main":
         if context.search_results is None or context.search_results.is_empty():
             return {"type": "depth_state", "open": False, "error": "no_search_results"}, None
-        base = context.search_results.get_dataframe().copy()
+        base = share_frame(context.search_results.get_dataframe())
         context.depth_state = {
-            "original": base.copy(),
-            "current": base.copy(),
+            "original": share_frame(base),
+            "current": share_frame(base),
             "query": "",
             "exclude": "",
             "ratings": {rating: True for rating in "eqsg"},
@@ -226,18 +227,18 @@ def handle_depth_action(context: WebSessionContext, command: dict[str, Any]) -> 
             with search_pool_state_guard(context):
                 reset_active_tag_filter_assignment(context)
                 context.save_search_filter_state(tag_filter=[], tag_filter_exclude=[], tag_filter_active=False)
-                context.search_results.set_dataframe(current.copy())
-                context.search_results_snapshot = current.copy()
+                context.search_results.set_dataframe(share_frame(current))
+                context.search_results_snapshot = share_frame(current)
                 mark_search_pool_replaced(context)
         return depth_payload(context), context.search_state_payload()
     elif action == "promote":
         current = state.get("current")
         if current is not None:
-            state["original"] = current.copy()
+            state["original"] = share_frame(current)
     elif action == "restore":
         original = state.get("original")
         if original is not None:
-            state["current"] = original.copy()
+            state["current"] = share_frame(original)
     elif action == "stage":
         current = state.get("current")
         if current is not None and not getattr(current, "empty", True):
@@ -246,7 +247,7 @@ def handle_depth_action(context: WebSessionContext, command: dict[str, Any]) -> 
             state.setdefault("staging", []).append({
                 "query": str(state.get("query", "") or ""),
                 "exclude": str(state.get("exclude", "") or ""),
-                "df": current.copy(),
+                "df": share_frame(current),
             })
     elif action == "merge_staging":
         import pandas as pd

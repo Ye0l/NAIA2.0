@@ -313,6 +313,7 @@ class HeadlessSearchStateService:
                 return False
             from core.parquet_chunk_loader import read_parquet_chunked
             from core.search_result_model import SearchResultModel
+            from core.pool_disk_store import share_frame
 
             frame = read_parquet_chunked(path, progress=progress, compact_strings=True)
             if frame is None or frame.empty:
@@ -328,8 +329,8 @@ class HeadlessSearchStateService:
             guard = getattr(context, "search_pool_state_guard", None)
             with guard() if callable(guard) else nullcontext():
                 context.search_results = SearchResultModel(frame)
-                context.search_results_snapshot = frame.copy()
-                context.search_results_master_base_snapshot = frame.copy()
+                context.search_results_snapshot = share_frame(frame)
+                context.search_results_master_base_snapshot = share_frame(frame)
                 # 복원셋은 디스크에서 로드된 작업셋 → custom_parquet 스코프로 표기(Codex: scope 미설정
                 # 수정). 현재 정보용이며 green 검색은 스코프와 무관하게 아카이브를 재스캔한다. 상수는
                 # app.backend 계층이라 core 에서 import 하지 않고 리터럴을 쓴다.

@@ -199,6 +199,82 @@ def _read_row_groups(
     return frames
 
 
+def _read_parquet_to_disk(
+    parquet_file: Any,
+    columns: Optional[list[str]],
+    total: int,
+    batch_rows: int,
+    tick: Callable[[int, int], None],
+) -> Any:
+    """Stream a parquet into a disk-backed (mmap) frame, or ``None`` when the
+    pool should stay in RAM or the spill could not be completed."""
+    try:
+        from core import pool_disk_store
+    except Exception:
+        return None
+    if not pool_disk_store.wants_disk(total):
+        return None
+    writer = None
+    try:
+        try:
+            expected = int(sum(
+                parquet_file.metadata.row_group(i).total_byte_size
+                for i in range(parquet_file.metadata.num_row_groups)
+            ))
+        except Exception:
+            expected = 0
+        writer = pool_disk_store.SpillWriter("load", expected_bytes=expected)
+        batch_size = max(int(batch_rows or 0), pool_disk_store.CHUNK_ROWS)
+        iterator = (
+            parquet_file.iter_batches(batch_size=batch_size, columns=columns)
+            if columns is not None
+            else parquet_file.iter_batches(batch_size=batch_size)
+        )
+        loaded = 0
+        import pyarrow as pa
+
+        for batch in iterator:
+            writer.write_table(pa.Table.from_batches([batch]))
+            loaded += batch.num_rows
+            tick(loaded, total or loaded)
+        if writer.rows == 0:
+            writer.abort()
+            return None
+        table = writer.finish()
+        writer = None
+        frame = pool_disk_store.frame_from_table(table)
+        if not _is_default_range(frame):
+            # Same contract as the RAM path: callers get a fresh RangeIndex.
+            frame = frame.reset_index(drop=True)
+        return frame
+    except MemoryError:
+        if writer is not None:
+            writer.abort()
+        raise
+    except Exception as exc:
+        if writer is not None:
+            writer.abort()
+        try:
+            from core.safe_console import safe_print
+
+            safe_print(f"⚠️ pool disk load skipped, reading into RAM: {exc}")
+        except Exception:
+            pass
+        return None
+    finally:
+        release_arrow_pool()
+
+
+def _is_default_range(frame: Any) -> bool:
+    try:
+        import pandas as pd
+
+        index = frame.index
+        return isinstance(index, pd.RangeIndex) and index.start == 0 and index.step == 1
+    except Exception:
+        return False
+
+
 def read_parquet_chunked(
     path: Path | str | bytes,
     *,
@@ -247,6 +323,15 @@ def read_parquet_chunked(
 
     total = int(parquet_file.metadata.num_rows) if parquet_file.metadata is not None else 0
     _tick(0, total)
+
+    # A pool big enough to matter goes straight from parquet to a mapped Arrow
+    # file, batch by batch: no pandas frame of the whole pool ever exists on the
+    # heap, and the strings of the result live in page cache instead
+    # (core/pool_disk_store.py). Any failure falls through to the RAM path.
+    if compact_strings:
+        frame = _read_parquet_to_disk(parquet_file, columns, total, batch_rows, _tick)
+        if frame is not None:
+            return frame
 
     # Arrow-backed strings keep UTF-8 buffers shared across concatenation and
     # snapshot copies instead of allocating a Python object per cell. Numeric
