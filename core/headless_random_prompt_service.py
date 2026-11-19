@@ -15,6 +15,7 @@ import pandas as pd
 from core.headless_search_state_service import DEFAULT_ACTIVE_RATINGS
 from core.prompt_generation_service import PromptGenerationService
 from core.safe_console import safe_print
+from core.pool_disk_store import share_frame, subset_frame
 
 # 조건부 캐릭터 스킵 중 **경고를 띄우지 않는** 사유.
 #
@@ -780,7 +781,7 @@ class HeadlessRandomPromptService:
 
         snapshot = getattr(self.context, "search_results_snapshot", None)
         if snapshot is not None and not getattr(snapshot, "empty", True):
-            self.context.search_results = SearchResultModel(snapshot.copy())
+            self.context.search_results = SearchResultModel(share_frame(snapshot))
             safe_print(f"🌐 Headless Remote: search_results restored from memory snapshot ({self.context.search_results.get_count()} rows)")
             return True
 
@@ -801,7 +802,7 @@ class HeadlessRandomPromptService:
                 return True
             snapshot = getattr(self.context, "search_results_snapshot", None)
             if snapshot is not None and not getattr(snapshot, "empty", True):
-                self.context.search_results = SearchResultModel(snapshot.copy())
+                self.context.search_results = SearchResultModel(share_frame(snapshot))
                 safe_print(f"🌐 Headless Remote: search_results restored from memory snapshot ({self.context.search_results.get_count()} rows)")
                 return True
 
@@ -842,14 +843,14 @@ class HeadlessRandomPromptService:
                     if self._should_skip_fallback_source(label, frame):
                         continue
                     if "rating" in frame.columns and label == "fallback parquet":
-                        frame = frame[frame["rating"] == "s"]
+                        frame = subset_frame(frame, frame["rating"] == "s")
                     if frame.empty:
                         continue
                     frame = frame.reset_index(drop=True)
                     guard = getattr(self.context, "search_pool_state_guard", None)
                     with guard() if callable(guard) else nullcontext():
                         self.context.search_results = SearchResultModel(frame)
-                        self.context.search_results_snapshot = frame.copy()
+                        self.context.search_results_snapshot = share_frame(frame)
                         if "tag archive" in label:
                             self.context.search_results_scope = "tag_archive"
                         marker = getattr(self.context, "mark_search_pool_replaced", None)

@@ -47,13 +47,17 @@ services:
       # react, and the restart policy turns that into a loop. Set this to 1 to
       # boot with an empty pool, then load a smaller one from the UI.
       NAIA_SKIP_POOL_RESTORE: "${NAIA_SKIP_POOL_RESTORE:-0}"
+      # Large pools live in memory-mapped files under /data/cache/pool_spill, so
+      # their tag text is page cache the kernel can evict, not heap. 0 = RAM.
+      NAIA_POOL_ON_DISK: "${NAIA_POOL_ON_DISK:-1}"
+      NAIA_POOL_DISK_MIN_ROWS: "${NAIA_POOL_DISK_MIN_ROWS:-100000}"
       # Ollama running on the host rather than in this container:
       # NAIA_OLLAMA_URL: "http://host.docker.internal:11434"
 
-    # NAIA holds the whole search pool in memory, so size this to the pool you
-    # work with, not to the image. A few million rows of real tag data runs to
-    # several GB once the pool, its snapshots and the filter index are all live.
-    # Leaving it unset means the container may use everything the host has.
+    # Large pools are served from memory-mapped files, so this no longer has to
+    # hold the whole pool: a 2M-row pool runs in 2g (about 1.2GB of heap, the
+    # rest page cache the kernel can drop). More memory still means fewer disk
+    # reads. Leaving it unset means the container may use everything the host has.
     # mem_limit: 12g
     # cpus: 4        # what the multi-core paths size their thread pools from
 

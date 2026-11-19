@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from core.parquet_chunk_loader import release_arrow_pool
+from core.pool_disk_store import needs_spill, share_frame, spill_frame, take_frame
 
 
 def _text_series(series: pd.Series) -> pd.Series:
@@ -101,7 +102,16 @@ class _SearchResultBucket:
     def remaining_dataframe(self) -> pd.DataFrame:
         if not self.consumed_indices:
             return self.df
-        return self.df.drop(index=list(self.consumed_indices), errors="ignore")
+        # Same rows/order/labels as ``df.drop(index=consumed)``, but gathered to
+        # disk in chunks when the bucket is large — a drop() is a full take and
+        # would rebuild the whole remaining pool on the heap.
+        keep = np.ones(len(self.df), dtype=bool)
+        consumed = np.fromiter(
+            (index for index in self.consumed_indices if 0 <= index < len(self.df)),
+            dtype=np.int64,
+        )
+        keep[consumed] = False
+        return take_frame(self.df, np.flatnonzero(keep), tag="remaining")
 
     def valid_prompt_mask(self) -> pd.Series:
         if self.valid_prompt_mask_cache is not None:
@@ -429,11 +439,23 @@ class SearchResultModel:
                 yield int(bucket_id), frame.iloc[start:end].reset_index(drop=True)
             return
 
-        bucket_series = pd.Series(bucket_ids, index=frame.index)
-        for bucket_id in pd.unique(bucket_ids):
-            chunk = frame.loc[bucket_series == bucket_id].reset_index(drop=True)
-            if not chunk.empty:
-                yield int(bucket_id), chunk
+        # Interleaved buckets: stable-group the rows by bucket (in order of first
+        # appearance, which is the order the buckets were yielded in before) with
+        # one gather — on disk for a large pool — and hand out positional slices
+        # of it. Each bucket gets exactly the rows, in the same order, that a
+        # per-bucket boolean selection produced, without one heap copy per bucket.
+        order_ids = pd.unique(bucket_ids)
+        rank = np.empty(int(bucket_ids.max()) + 1, dtype=np.int64)
+        rank[order_ids] = np.arange(len(order_ids))
+        permutation = np.argsort(rank[bucket_ids], kind="stable")
+        grouped = take_frame(frame, permutation, tag="buckets").reset_index(drop=True)
+        counts = np.bincount(rank[bucket_ids], minlength=len(order_ids))
+        start = 0
+        for bucket_id, count in zip(order_ids, counts):
+            end = start + int(count)
+            if count:
+                yield int(bucket_id), grouped.iloc[start:end].reset_index(drop=True)
+            start = end
 
     def _invalidate_caches(self):
         self._rating_counts_cache = None
@@ -547,7 +569,14 @@ class SearchResultModel:
         import gc
 
         if new_df is self.df or new_df is self._pending_dataframe:
-            new_df = new_df.copy()
+            new_df = share_frame(new_df)
+        # Every pool replacement funnels through here, so this is the backstop
+        # that moves a large pool to disk whichever path built it (a filter, a
+        # merge, a refine assignment). Frames already mapped are left alone.
+        if new_df is not None and needs_spill(new_df):
+            spilled = spill_frame(new_df)
+            if spilled is not None:
+                new_df = spilled
 
         if hasattr(self, "df") and self.df is not None:
             # 예전에는 참조를 끊기 전에 ``self.df.drop(self.df.index, inplace=True)`` 로
