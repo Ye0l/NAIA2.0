@@ -115,3 +115,12 @@ def register_state_routes(
     @app.get("/api/runtime/capabilities")
     async def api_runtime_capabilities():
         return runtime_capabilities_payload()
+
+    @app.get("/api/system/memory")
+    async def api_system_memory():
+        # Toolbar memory indicator (polled). Cheap /proc reads, but off the
+        # event loop all the same: the pool probe touches /proc/self/maps.
+        from core.process_memory import memory_snapshot
+
+        payload = await run_in_thread(memory_snapshot, session_context)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store, max-age=0"})

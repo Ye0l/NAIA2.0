@@ -2178,6 +2178,12 @@ const dataBootstrapReady = import('./js/features/dataBootstrapPanel.mjs?v=202605
   .catch(error => {
     console.error('Failed to initialize data bootstrap panel module', error);
   });
+// Toolbar memory indicator (backend heap vs container limit), polled.
+import('./js/features/memoryPill.mjs?v=20261120-mem')
+  .then(({createMemoryPill}) => createMemoryPill({document}).init())
+  .catch(error => {
+    console.error('Failed to initialize memory pill module', error);
+  });
 let updateBanner = null;
 const updateBannerReady = import('./js/features/updateBannerControls.mjs?v=20260607-srcupd2')
   .then(({createUpdateBanner}) => {

@@ -19284,6 +19284,43 @@ select.setup-input { cursor: pointer; }
 .shell-toolbar .anlas-pill.hidden + .mode-api-combo {
   margin-left: auto;
 }
+
+/* ---- 메모리 표시 (2026-11-20) ----
+   Anlas pill 과 같은 모양. 툴바에서 오른쪽으로 미는 margin-left:auto 를 이 pill 이
+   가져가고, 뒤따르는 Anlas/모드 콤보는 붙여 둔다. 한도 대비 80%/92% 에서 색이 바뀐다. */
+.mem-pill {
+  display: flex; align-items: center; gap: 7px;
+  font-family: var(--font-mono);
+  border: 1px solid rgba(232,232,240,0.12);
+  user-select: none;
+  cursor: default;
+}
+.mem-pill.hidden { display: none; }
+.shell-toolbar .mem-pill {
+  height: 25px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 9px;
+  border-radius: 13px;
+  background: rgba(18,18,26,0.78);
+}
+.shell-toolbar .mem-pill:not(.hidden) + .anlas-pill { margin-left: 0; }
+.shell-toolbar .mem-pill:not(.hidden) + .anlas-pill.hidden + .mode-api-combo { margin-left: 0; }
+.mem-label {
+  color: var(--text-dim);
+  font-size: 8px; font-weight: 500;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+.mem-value {
+  color: var(--text-primary);
+  font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+}
+.mem-pill.warn   .mem-value { color: #e8b04a; }
+.mem-pill.danger .mem-value { color: #ff6b6b; }
+.mem-pill.danger { border-color: rgba(255,90,90,0.45); }
 .anlas-label {
   color: var(--text-dim);
   font-size: 8px; font-weight: 500;
@@ -19318,7 +19355,8 @@ select.setup-input { cursor: pointer; }
     min-width: 150px;
     max-width: 220px;
   }
-  .shell-toolbar .anlas-pill {
+  .shell-toolbar .anlas-pill,
+  .shell-toolbar .mem-pill {
     height: 25px;
     padding: 0 8px;
   }
@@ -19337,7 +19375,8 @@ select.setup-input { cursor: pointer; }
 
 @media (max-width: 620px) {
   .shell-brand-subtitle,
-  .shell-toolbar .anlas-label {
+  .shell-toolbar .anlas-label,
+  .shell-toolbar .mem-label {
     display: none;
   }
   .shell-toolbar .prompt-quick-control {
