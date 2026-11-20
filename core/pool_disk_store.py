@@ -226,6 +226,17 @@ def _live_regions() -> list[tuple[int, int]]:
         return [(start, end) for start, end, _ in _regions]
 
 
+def mapped_bytes() -> Optional[int]:
+    """Total size of this process's live spill mappings (0 before the first
+    spill), or ``None`` where it cannot be determined."""
+    if _process_dir is None:
+        return 0
+    try:
+        return int(sum(end - start for start, end in _live_regions()))
+    except Exception:
+        return None
+
+
 def _arrow_chunks(series: Any):
     values = getattr(getattr(series, "array", None), "_pa_array", None)
     if values is None:
